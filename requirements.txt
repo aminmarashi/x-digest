@@ -1,0 +1,4 @@
+twikit>=2.3
+anthropic>=0.69
+python-dotenv>=1.0
+pydantic>=2

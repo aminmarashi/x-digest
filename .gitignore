@@ -1,0 +1,6 @@
+.env
+cookies.json
+digests/
+__pycache__/
+*.pyc
+.venv/
