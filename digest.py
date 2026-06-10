@@ -53,11 +53,19 @@ technical enough, leave it out.
 
 You get a numbered list of tweets. For each tweet worth this person's reading time, emit a
 pick with the tweet's index, a short theme (2-4 words, reuse themes across picks so they
-group well), a 1-10 relevance score, and one sentence on why it earns a spot. Score 10 means
-"would have hunted this down anyway", 6 means "worth a skim". Skip everything below 6; do
-not pad the list. Judge linked content by the tweet's description of it. Retweets count for
-their content, not the retweeter. Also report skipped_themes: the 3-5 topics that dominated
-the timeline but did not make the cut, so the person can sanity-check the filter."""
+group well), a 1-10 relevance score, one sentence on why it earns a spot, and a description.
+Score 10 means "would have hunted this down anyway", 6 means "worth a skim". Skip everything
+below 6; do not pad the list. Judge linked content by the tweet's description of it. Retweets
+count for their content, not the retweeter. Also report skipped_themes: the 3-5 topics that
+dominated the timeline but did not make the cut, so the person can sanity-check the filter.
+
+The description is a short, plain-language statement of what the tweet is actually about, in
+simple words a tired engineer can skim. Strip every bit of fluff and every buzzword: no
+"revolutionary", "game-changing", "essential", "powerful", "seamless", "frontier",
+"comprehensive", "cutting-edge", "unlock", "leverage", "transform", "next-generation", no
+breathless adjectives, no marketing. State only the concrete technical fact: what was built,
+measured, or shown. If, once you remove the fluff and buzzwords, there is no concrete
+technical substance left to state, return an empty string for description."""
 
 
 class Pick(BaseModel):
@@ -65,6 +73,7 @@ class Pick(BaseModel):
     theme: str
     score: int
     reason: str
+    description: str
 
 
 class Digest(BaseModel):
@@ -266,7 +275,9 @@ def score_tweets(tweets: list) -> Digest:
 def write_digest(tweets: list, digest: Digest, reposts: int, likes: int, follows: int) -> Path:
     today = datetime.now().strftime("%Y-%m-%d")
     reposted, liked, followed = load_state()
-    valid = [p for p in digest.picks if 0 <= p.tweet_index < len(tweets) and p.score >= MIN_SCORE]
+    valid = [p for p in digest.picks
+             if 0 <= p.tweet_index < len(tweets) and p.score >= MIN_SCORE
+             and p.description.strip()]
     by_theme: dict[str, list[Pick]] = {}
     for pick in sorted(valid, key=lambda p: -p.score):
         by_theme.setdefault(pick.theme, []).append(pick)
@@ -294,6 +305,7 @@ def write_digest(tweets: list, digest: Digest, reposts: int, likes: int, follows
             if len(snippet) > 200:
                 snippet = snippet[:200] + "..."
             lines.append(f"- **@{source.user.screen_name}** ({pick.score}/10){tag} {pick.reason}")
+            lines.append(f"  {pick.description.strip()}")
             lines.append(f"  > {snippet}")
             lines.append(f"  {tweet_url(source)}")
             for link in tweet_links(source):
