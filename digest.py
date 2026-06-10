@@ -61,12 +61,31 @@ def require_env(*names: str) -> None:
         sys.exit(f"Missing {', '.join(missing)} - copy .env.example to .env and fill it in.")
 
 
+def env_secret(name: str) -> str | None:
+    """Read an env var; values like op://vault/item/field resolve via the 1Password CLI."""
+    value = os.getenv(name)
+    if not value or not value.startswith("op://"):
+        return value
+    if shutil.which("op") is None:
+        sys.exit(f"{name} is a 1Password reference but the op CLI is not installed:\n"
+                 "https://developer.1password.com/docs/cli/get-started/")
+    result = subprocess.run(["op", "read", "--no-newline", value],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"op read failed for {name}: {result.stderr.strip()[:300]}\n"
+                 "Unlock 1Password first (enable the desktop app CLI integration, "
+                 "or run: eval $(op signin)).")
+    return result.stdout
+
+
 async def fetch_tweets() -> list:
+    username = env_secret("X_USERNAME")
     client = Client("en-US")
     await client.login(
-        auth_info_1=os.environ["X_USERNAME"],
-        auth_info_2=os.getenv("X_EMAIL") or os.environ["X_USERNAME"],
-        password=os.environ["X_PASSWORD"],
+        auth_info_1=username,
+        auth_info_2=env_secret("X_EMAIL") or username,
+        password=env_secret("X_PASSWORD"),
+        totp_secret=env_secret("X_TOTP_SECRET"),
         cookies_file=str(COOKIES_FILE),
     )
     cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
