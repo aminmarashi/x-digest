@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
 from twikit import Client
 
+import twikit_patch  # noqa: F401  applies the d60/twikit#408 fix on import
+
 ROOT = Path(__file__).parent
 COOKIES_FILE = ROOT / "cookies.json"
 DIGEST_DIR = ROOT / "digests"
@@ -55,12 +57,6 @@ class Digest(BaseModel):
     skipped_themes: list[str]
 
 
-def require_env(*names: str) -> None:
-    missing = [n for n in names if not os.getenv(n)]
-    if missing:
-        sys.exit(f"Missing {', '.join(missing)} - copy .env.example to .env and fill it in.")
-
-
 def env_secret(name: str) -> str | None:
     """Read an env var; values like op://vault/item/field resolve via the 1Password CLI."""
     value = os.getenv(name)
@@ -78,9 +74,32 @@ def env_secret(name: str) -> str | None:
     return result.stdout
 
 
-async def fetch_tweets() -> list:
+async def authenticate(client: Client) -> None:
+    """Prefer a cached or supplied browser session; fall back to credential login.
+
+    The session-cookie path is the one to use: log in to X once in your browser (where
+    the 1Password passkey works), copy the auth_token and ct0 cookies, and the script
+    reuses the session. Credential login hits X's onboarding flow, which Cloudflare
+    blocks from many IPs, so it is a last resort.
+    """
+    if COOKIES_FILE.exists():
+        client.load_cookies(str(COOKIES_FILE))
+        return
+
+    auth_token = env_secret("X_AUTH_TOKEN")
+    ct0 = env_secret("X_CT0")
+    if auth_token and ct0:
+        client.set_cookies({"auth_token": auth_token, "ct0": ct0})
+        client.save_cookies(str(COOKIES_FILE))
+        return
+
     username = env_secret("X_USERNAME")
-    client = Client("en-US")
+    if not username or not env_secret("X_PASSWORD"):
+        sys.exit(
+            "No X session found. Set X_AUTH_TOKEN and X_CT0 (recommended): log in to X in "
+            "your browser with your passkey, then copy those two cookies from DevTools > "
+            "Application > Cookies. See the README. Credential login (X_USERNAME / "
+            "X_PASSWORD) is a fallback and is often blocked by Cloudflare.")
     await client.login(
         auth_info_1=username,
         auth_info_2=env_secret("X_EMAIL") or username,
@@ -88,6 +107,11 @@ async def fetch_tweets() -> list:
         totp_secret=env_secret("X_TOTP_SECRET"),
         cookies_file=str(COOKIES_FILE),
     )
+
+
+async def fetch_tweets() -> list:
+    client = Client("en-US")
+    await authenticate(client)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
     tweets: list = []
     page = await client.get_latest_timeline(count=40)
@@ -210,7 +234,6 @@ def write_digest(tweets: list, digest: Digest) -> Path:
 
 def main() -> None:
     load_dotenv(ROOT / ".env")
-    require_env("X_USERNAME", "X_PASSWORD")
 
     print(f"Fetching timeline (last {HOURS_BACK:g}h, max {MAX_TWEETS} tweets)...")
     tweets = asyncio.run(fetch_tweets())

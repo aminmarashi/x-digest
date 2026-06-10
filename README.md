@@ -7,12 +7,12 @@ of the timeline.
 
 ## How it works
 
-1. [twikit](https://github.com/d60/twikit) logs in to X with your username and password
+1. [twikit](https://github.com/d60/twikit) reads your timeline using a browser session
    (the official API no longer has a free read tier; the cheapest plan that can read your
-   timeline is $200/month). Credentials are read from `.env` as 1Password secret
-   references and resolved at runtime with the `op` CLI, so no secret is stored on disk.
-   The session cookie is cached in `cookies.json`, so it logs in once and reuses the
-   session after that.
+   timeline is $200/month). You log in to X once in your browser and hand the script two
+   session cookies; it caches them in `cookies.json` and reuses the session after that.
+   The cookies are read from `.env` as 1Password secret references and resolved at runtime
+   with the `op` CLI, so no secret is stored on disk.
 2. Tweets get scored by Claude through the [Claude Code](https://code.claude.com) CLI
    (`claude -p`), with the persona as the rubric. It runs on whatever Claude login you
    already have, so there is no API key to manage. The model picks what is worth your time,
@@ -39,20 +39,29 @@ cp .env.example .env   # then fill it in
 
 `.env` is gitignored, and with 1Password references it contains no secrets at all: any
 value of the form `op://<vault>/<item>/<field>` is resolved through `op read` when the
-script runs, so the password only ever exists in your vault and in memory. Plain values
+script runs, so the cookie only ever exists in your vault and in memory. Plain values
 still work if you skip 1Password.
 
-| Variable        | What                                                          |
-|-----------------|---------------------------------------------------------------|
-| `X_USERNAME`    | your X handle, without the @                                  |
-| `X_EMAIL`       | the email on the account (X sometimes asks for it at login)   |
-| `X_PASSWORD`    | your X password                                               |
-| `X_TOTP_SECRET` | optional, the base32 TOTP secret if the account has 2FA       |
+**Get the two cookies (recommended).** Log in to X in your browser; this is where your
+1Password passkey works. Then open DevTools (F12) > Application > Cookies >
+`https://x.com` and copy the values of `auth_token` and `ct0`. Store them in 1Password and
+point `.env` at them:
 
-A note on passkeys: X passkey login is WebAuthn, which only works through a browser with
-an authenticator (like the 1Password extension). twikit drives the app login flow, so it
-still needs the password; storing it in 1Password and resolving it at runtime is as close
-as this setup can get.
+| Variable       | What                                            |
+|----------------|--------------------------------------------------|
+| `X_AUTH_TOKEN` | the `auth_token` cookie (your session token)     |
+| `X_CT0`        | the `ct0` cookie (CSRF token)                     |
+
+That is the whole login. The script writes `cookies.json` on the first run and reuses it,
+so you only re-copy the cookies when the session eventually expires.
+
+**Why not a password or passkey directly?** X passkey login is WebAuthn, which only works
+in a browser with an authenticator (the 1Password extension), so a script can't perform
+it. The cookie approach is the way to get a passkey-backed session into the script: you
+authenticate in the browser with the passkey, then reuse the resulting session. Plain
+username/password login (`X_USERNAME`, `X_PASSWORD`, optional `X_EMAIL` / `X_TOTP_SECRET`)
+still exists as a fallback, but X fronts that flow with Cloudflare and frequently blocks
+it, so prefer the cookies.
 
 ## Run
 
@@ -79,7 +88,10 @@ loop; if it keeps skipping things you wanted, add them to the persona.
 
 ## Caveats
 
-- Logging in with credentials through an unofficial client is against X's terms of service.
+- `twikit_patch.py` works around a March 2026 change to X's web client that breaks
+  twikit 2.3.3's transaction-ID parsing ([d60/twikit#408](https://github.com/d60/twikit/issues/408)).
+  It is imported automatically; remove it once upstream ships a fix.
+- Reading X through an unofficial client is against X's terms of service.
   One read-only run a day is low traffic, but the account could in principle get flagged.
   Use a throwaway account if that worries you.
 - Credentials never leave your machine except to go to X itself; they live in 1Password
