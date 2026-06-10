@@ -45,6 +45,21 @@ OpenAI models into the products I build on the side.
 - Contrarian is fine when argued. Skepticism about AI hype is welcome; cheerleading is not.
 - Internals and "how it actually works" deep dives are always interesting.
 
+## Technical only (hard filter)
+
+I want technical substance: engineering, systems, code, architecture, research results and
+methods, benchmarks, how things actually work, tools and APIs. If a post is not technical, I
+do not want it, even when the topic is one I otherwise care about. In particular, filter out
+(regardless of topical match):
+
+- Complaints or commentary about a company's or product's policy, pricing, or behavior.
+- Fear, doom, or hype about the future of AI; "AI will/won't take our jobs" takes.
+- Opinion, punditry, predictions, and hot takes with no technical content to learn from.
+- Career, hiring, funding, and business gossip; industry drama.
+
+The test: would I learn something I could act on or build with? If it's just someone's view,
+drop it.
+
 ## Drop these
 
 - Engagement bait, threads that restate documentation, "10 tools you must know" lists.

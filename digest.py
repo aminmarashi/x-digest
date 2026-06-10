@@ -31,7 +31,9 @@ HOURS_BACK = float(os.getenv("HOURS_BACK", "24"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "6"))          # appears in the markdown digest
 REPOST_MIN_SCORE = int(os.getenv("REPOST_MIN_SCORE", "8"))  # reposted to your timeline
 LIKE_MIN_SCORE = int(os.getenv("LIKE_MIN_SCORE", "9"))      # also liked
+FOLLOW_MIN_SCORE = int(os.getenv("FOLLOW_MIN_SCORE", "10")) # author followed
 REPOST_MAX_PER_RUN = int(os.getenv("REPOST_MAX_PER_RUN", "25"))  # safety cap per run
+FOLLOW_MAX_PER_RUN = int(os.getenv("FOLLOW_MAX_PER_RUN", "10"))  # safety cap per run
 
 SYSTEM = f"""You curate a daily reading list from an X timeline for one specific person.
 Their persona follows; treat it as the rubric.
@@ -39,6 +41,15 @@ Their persona follows; treat it as the rubric.
 <persona>
 {PERSONA}
 </persona>
+
+Hard filter, applied before anything else: this person only wants technical substance --
+engineering, systems, code, architecture, research results and methods, benchmarks, how
+things actually work, tools and APIs. Exclude anything whose value is commentary rather
+than technical content, EVEN IF the topic matches the persona: company or product policy
+complaints, AI hype or fear/doom about the future, opinion, punditry, predictions, hot
+takes, career or business gossip, funding, and drama. If a tweet is not technical, it does
+not qualify -- score it 2 or below so it drops out. When unsure whether something is
+technical enough, leave it out.
 
 You get a numbered list of tweets. For each tweet worth this person's reading time, emit a
 pick with the tweet's index, a short theme (2-4 words, reuse themes across picks so they
@@ -101,20 +112,23 @@ async def fetch_timeline(client: Client) -> list:
     return tweets[:MAX_TWEETS]
 
 
-def load_state() -> tuple[set[str], set[str]]:
-    """Tweet ids already reposted / liked, so daily runs don't act on the same tweet twice."""
+def load_state() -> tuple[set[str], set[str], set[str]]:
+    """Ids already reposted / liked (tweets) and followed (users), so daily runs don't
+    act on the same thing twice."""
     if STATE_FILE.exists():
         try:
             data = json.loads(STATE_FILE.read_text())
-            return set(data.get("reposted", [])), set(data.get("liked", []))
+            return (set(data.get("reposted", [])), set(data.get("liked", [])),
+                    set(data.get("followed", [])))
         except (ValueError, OSError):
             pass
-    return set(), set()
+    return set(), set(), set()
 
 
-def save_state(reposted: set[str], liked: set[str]) -> None:
+def save_state(reposted: set[str], liked: set[str], followed: set[str]) -> None:
     STATE_FILE.write_text(json.dumps(
-        {"reposted": sorted(reposted), "liked": sorted(liked)}, indent=2))
+        {"reposted": sorted(reposted), "liked": sorted(liked), "followed": sorted(followed)},
+        indent=2))
 
 
 def _first_line(err: Exception) -> str:
@@ -122,14 +136,17 @@ def _first_line(err: Exception) -> str:
     return (text[0] if text else repr(err))[:120]
 
 
-async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[int, int]:
-    """Repost picks scoring REPOST_MIN_SCORE+, also like those scoring LIKE_MIN_SCORE+.
+async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[int, int, int]:
+    """Repost picks scoring REPOST_MIN_SCORE+, like those at LIKE_MIN_SCORE+, and follow
+    the author of anything at FOLLOW_MIN_SCORE+.
 
     This is what turns your profile into the feed you read: highest-confidence picks get
-    reposted (and the very best liked), skipping anything already acted on.
+    reposted (and the very best liked), and authors of a perfect-score tweet get followed
+    so the next ones reach you directly. New follows come mostly from reposts in your feed
+    of accounts you don't already follow. Anything already acted on is skipped.
     """
-    reposted, liked = load_state()
-    new_reposts = new_likes = 0
+    reposted, liked, followed = load_state()
+    new_reposts = new_likes = new_follows = 0
     candidates = sorted(
         (p for p in digest.picks
          if 0 <= p.tweet_index < len(tweets) and p.score >= REPOST_MIN_SCORE),
@@ -141,7 +158,8 @@ async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[in
             break
         tweet = tweets[pick.tweet_index]
         source = getattr(tweet, "retweeted_tweet", None) or tweet
-        tid, handle = str(source.id), source.user.screen_name
+        tid, author = str(source.id), source.user
+        handle, uid = author.screen_name, str(author.id)
 
         if tid not in reposted and not getattr(source, "retweeted", False):
             try:
@@ -164,9 +182,20 @@ async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[in
             except Exception as err:
                 print(f"  like failed for @{handle}: {_first_line(err)}")
 
-    if new_reposts or new_likes:
-        save_state(reposted, liked)
-    return new_reposts, new_likes
+        if pick.score >= FOLLOW_MIN_SCORE and new_follows < FOLLOW_MAX_PER_RUN \
+                and uid not in followed and getattr(author, "following", None) is not True:
+            try:
+                await client.follow_user(uid)
+                followed.add(uid)
+                new_follows += 1
+                print(f"  followed @{handle} (scored a 10)")
+                await asyncio.sleep(2)
+            except Exception as err:
+                print(f"  follow failed for @{handle}: {_first_line(err)}")
+
+    if new_reposts or new_likes or new_follows:
+        save_state(reposted, liked, followed)
+    return new_reposts, new_likes, new_follows
 
 
 def tweet_url(tweet) -> str:
@@ -234,9 +263,9 @@ def score_tweets(tweets: list) -> Digest:
         sys.exit(f"claude returned JSON that does not match the schema: {err}")
 
 
-def write_digest(tweets: list, digest: Digest, reposts: int, likes: int) -> Path:
+def write_digest(tweets: list, digest: Digest, reposts: int, likes: int, follows: int) -> Path:
     today = datetime.now().strftime("%Y-%m-%d")
-    reposted, liked = load_state()
+    reposted, liked, followed = load_state()
     valid = [p for p in digest.picks if 0 <= p.tweet_index < len(tweets) and p.score >= MIN_SCORE]
     by_theme: dict[str, list[Pick]] = {}
     for pick in sorted(valid, key=lambda p: -p.score):
@@ -244,7 +273,7 @@ def write_digest(tweets: list, digest: Digest, reposts: int, likes: int) -> Path
 
     lines = [f"# Reading list, {today}", ""]
     lines.append(f"{len(valid)} picks from {len(tweets)} tweets in the last {HOURS_BACK:g} hours; "
-                 f"reposted {reposts}, liked {likes} to your timeline.")
+                 f"reposted {reposts}, liked {likes}, followed {follows} new account(s).")
     lines.append("")
     for theme, picks in sorted(by_theme.items(), key=lambda kv: -max(p.score for p in kv[1])):
         lines.append(f"## {theme}")
@@ -258,6 +287,8 @@ def write_digest(tweets: list, digest: Digest, reposts: int, likes: int) -> Path
                 tags.append("reposted")
             if tid in liked:
                 tags.append("liked")
+            if str(source.user.id) in followed:
+                tags.append("followed")
             tag = f" _({', '.join(tags)})_" if tags else ""
             snippet = " ".join(tweet_text(source).split())
             if len(snippet) > 200:
@@ -290,9 +321,9 @@ async def run() -> Path | None:
         return None
     print(f"Scoring {len(tweets)} tweets against persona.md...")
     digest = score_tweets(tweets)
-    print(f"Reposting picks scoring {REPOST_MIN_SCORE}+, liking {LIKE_MIN_SCORE}+ ...")
-    reposts, likes = await act_on_picks(client, tweets, digest)
-    return write_digest(tweets, digest, reposts, likes)
+    print(f"Reposting {REPOST_MIN_SCORE}+, liking {LIKE_MIN_SCORE}+, following {FOLLOW_MIN_SCORE}+ ...")
+    reposts, likes, follows = await act_on_picks(client, tweets, digest)
+    return write_digest(tweets, digest, reposts, likes, follows)
 
 
 def main() -> None:

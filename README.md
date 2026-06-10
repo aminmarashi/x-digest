@@ -17,14 +17,17 @@ what it did and why. Run it once a day.
    already have, so there is no API key to manage. The model picks what is worth your time,
    scores it 1-10, and groups it by theme.
 3. The script acts on the best picks, highest score first:
-   - score **10 and 9**: reposted **and** liked
+   - score **10**: reposted, liked, **and its author followed**
+   - score **9**: reposted and liked
    - score **8**: reposted
    - everything else: left alone (but still listed in the digest down to `MIN_SCORE`)
 
    It works top-down (10s, then 9s, then 8s) and stops reposting once it hits the per-run
-   cap, so the cap only ever drops the lowest-scoring picks. It never acts on a tweet twice:
-   ids it has already reposted or liked are remembered in `actions.json`, and it also skips
-   anything you reposted or liked yourself.
+   cap, so the cap only ever drops the lowest-scoring picks. It never acts on the same thing
+   twice: tweet ids it has reposted or liked and account ids it has followed are remembered
+   in `actions.json`, and it also skips anything you reposted, liked, or follow yourself. New
+   follows come mostly from reposts in your feed of accounts you don't already follow (when
+   someone you follow boosts a perfect-score tweet from a new account).
 4. Picks scoring `MIN_SCORE` (6) or higher are written to `digests/YYYY-MM-DD.md`, highest
    first, tagged with what action was taken. A "Skipped" section lists what dominated the
    feed but got filtered, so you can tell when the persona needs adjusting.
@@ -80,14 +83,19 @@ Optional knobs, also via `.env` or the environment:
 | `MIN_SCORE`          | `6`     | minimum score to appear in the markdown digest    |
 | `REPOST_MIN_SCORE`   | `8`     | reposted to your timeline at or above this score  |
 | `LIKE_MIN_SCORE`     | `9`     | also liked at or above this score                 |
+| `FOLLOW_MIN_SCORE`   | `10`    | author followed at or above this score            |
 | `REPOST_MAX_PER_RUN` | `25`    | safety cap on reposts per run                     |
+| `FOLLOW_MAX_PER_RUN` | `10`    | safety cap on new follows per run                 |
 
 ## Make it yours
 
 Everything the model knows about you lives in `persona.md`. Rewrite it: who you are, what to
-surface, what to drop. The "Skipped" section at the bottom of each digest is the feedback
-loop; if it keeps skipping things you wanted, add them to the persona. If too much (or too
-little) is reaching your timeline, move `REPOST_MIN_SCORE` / `LIKE_MIN_SCORE`.
+surface, what to drop. It includes a hard "technical only" filter that drops non-technical
+posts (policy complaints, AI hype/doom, punditry) even when the topic matches; loosen or
+tighten that section to taste. The "Skipped" section at the bottom of each digest is the
+feedback loop; if it keeps skipping things you wanted, adjust the persona. If too much (or
+too little) is reaching your timeline, move `REPOST_MIN_SCORE` / `LIKE_MIN_SCORE` /
+`FOLLOW_MIN_SCORE`.
 
 ## Caveats
 

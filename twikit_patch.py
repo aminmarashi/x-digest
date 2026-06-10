@@ -88,6 +88,9 @@ def patched_user_init(self, client, data):
     entities = legacy.setdefault("entities", {})
     entities.setdefault("description", {}).setdefault("urls", [])
     _original_user_init(self, client, data)
+    # twikit doesn't surface this; expose whether the authed user already follows them
+    # so we don't fire needless follow calls.
+    self.following = legacy.get("following")
 
 
 user_module.User.__init__ = patched_user_init
