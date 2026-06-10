@@ -21,13 +21,17 @@ import twikit_patch  # noqa: F401  applies the d60/twikit#408 fix on import
 
 ROOT = Path(__file__).parent
 COOKIES_FILE = ROOT / "cookies.json"
+STATE_FILE = ROOT / "actions.json"
 DIGEST_DIR = ROOT / "digests"
 PERSONA = (ROOT / "persona.md").read_text()
 
 MODEL = os.getenv("CLAUDE_MODEL", "haiku")
 MAX_TWEETS = int(os.getenv("MAX_TWEETS", "150"))
 HOURS_BACK = float(os.getenv("HOURS_BACK", "24"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "6"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "6"))          # appears in the markdown digest
+REPOST_MIN_SCORE = int(os.getenv("REPOST_MIN_SCORE", "8"))  # reposted to your timeline
+LIKE_MIN_SCORE = int(os.getenv("LIKE_MIN_SCORE", "9"))      # also liked
+REPOST_MAX_PER_RUN = int(os.getenv("REPOST_MAX_PER_RUN", "25"))  # safety cap per run
 
 SYSTEM = f"""You curate a daily reading list from an X timeline for one specific person.
 Their persona follows; treat it as the rubric.
@@ -57,48 +61,29 @@ class Digest(BaseModel):
     skipped_themes: list[str]
 
 
-def env_secret(name: str) -> str | None:
-    """Read an env var; values like op://vault/item/field resolve via the 1Password CLI."""
-    value = os.getenv(name)
-    if not value or not value.startswith("op://"):
-        return value
-    if shutil.which("op") is None:
-        sys.exit(f"{name} is a 1Password reference but the op CLI is not installed:\n"
-                 "https://developer.1password.com/docs/cli/get-started/")
-    result = subprocess.run(["op", "read", "--no-newline", value],
-                            capture_output=True, text=True)
-    if result.returncode != 0:
-        sys.exit(f"op read failed for {name}: {result.stderr.strip()[:300]}\n"
-                 "Unlock 1Password first (enable the desktop app CLI integration, "
-                 "or run: eval $(op signin)).")
-    return result.stdout
-
-
 def authenticate(client: Client) -> None:
     """Authenticate with a browser session.
 
-    Log in to X once in your browser (where the 1Password passkey works), copy the
-    auth_token and ct0 cookies, and the script reuses that session. After the first run
-    the cookies live in cookies.json, so the env vars are only needed once.
+    Log in to X once in your browser (where your passkey works), copy the auth_token and
+    ct0 cookies, and the script reuses that session. After the first run the cookies live
+    in cookies.json, so the env vars are only needed once.
     """
     if COOKIES_FILE.exists():
         client.load_cookies(str(COOKIES_FILE))
         return
 
-    auth_token = env_secret("X_AUTH_TOKEN")
-    ct0 = env_secret("X_CT0")
+    auth_token = os.getenv("X_AUTH_TOKEN")
+    ct0 = os.getenv("X_CT0")
     if not auth_token or not ct0:
         sys.exit(
-            "No X session found. Set X_AUTH_TOKEN and X_CT0: log in to X in your browser "
-            "with your passkey, then copy those two cookies from DevTools > Application > "
-            "Cookies. See the README.")
+            "No X session found. Set X_AUTH_TOKEN and X_CT0 in .env: log in to X in your "
+            "browser with your passkey, then copy those two cookies from DevTools > "
+            "Application > Cookies. See the README.")
     client.set_cookies({"auth_token": auth_token, "ct0": ct0})
     client.save_cookies(str(COOKIES_FILE))
 
 
-async def fetch_tweets() -> list:
-    client = Client("en-US")
-    authenticate(client)
+async def fetch_timeline(client: Client) -> list:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
     tweets: list = []
     page = await client.get_latest_timeline(count=40)
@@ -114,6 +99,74 @@ async def fetch_tweets() -> list:
             break
         page = await page.next()
     return tweets[:MAX_TWEETS]
+
+
+def load_state() -> tuple[set[str], set[str]]:
+    """Tweet ids already reposted / liked, so daily runs don't act on the same tweet twice."""
+    if STATE_FILE.exists():
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            return set(data.get("reposted", [])), set(data.get("liked", []))
+        except (ValueError, OSError):
+            pass
+    return set(), set()
+
+
+def save_state(reposted: set[str], liked: set[str]) -> None:
+    STATE_FILE.write_text(json.dumps(
+        {"reposted": sorted(reposted), "liked": sorted(liked)}, indent=2))
+
+
+def _first_line(err: Exception) -> str:
+    text = str(err).splitlines()
+    return (text[0] if text else repr(err))[:120]
+
+
+async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[int, int]:
+    """Repost picks scoring REPOST_MIN_SCORE+, also like those scoring LIKE_MIN_SCORE+.
+
+    This is what turns your profile into the feed you read: highest-confidence picks get
+    reposted (and the very best liked), skipping anything already acted on.
+    """
+    reposted, liked = load_state()
+    new_reposts = new_likes = 0
+    candidates = sorted(
+        (p for p in digest.picks
+         if 0 <= p.tweet_index < len(tweets) and p.score >= REPOST_MIN_SCORE),
+        key=lambda p: -p.score)
+
+    for pick in candidates:
+        if new_reposts >= REPOST_MAX_PER_RUN:
+            print(f"  hit repost cap ({REPOST_MAX_PER_RUN}); stopping.")
+            break
+        tweet = tweets[pick.tweet_index]
+        source = getattr(tweet, "retweeted_tweet", None) or tweet
+        tid, handle = str(source.id), source.user.screen_name
+
+        if tid not in reposted and not getattr(source, "retweeted", False):
+            try:
+                await client.retweet(tid)
+                reposted.add(tid)
+                new_reposts += 1
+                print(f"  reposted @{handle} ({pick.score}/10)")
+                await asyncio.sleep(2)
+            except Exception as err:
+                print(f"  repost failed for @{handle}: {_first_line(err)}")
+
+        if pick.score >= LIKE_MIN_SCORE and tid not in liked \
+                and not getattr(source, "favorited", False):
+            try:
+                await client.favorite_tweet(tid)
+                liked.add(tid)
+                new_likes += 1
+                print(f"  liked @{handle} ({pick.score}/10)")
+                await asyncio.sleep(2)
+            except Exception as err:
+                print(f"  like failed for @{handle}: {_first_line(err)}")
+
+    if new_reposts or new_likes:
+        save_state(reposted, liked)
+    return new_reposts, new_likes
 
 
 def tweet_url(tweet) -> str:
@@ -181,15 +234,17 @@ def score_tweets(tweets: list) -> Digest:
         sys.exit(f"claude returned JSON that does not match the schema: {err}")
 
 
-def write_digest(tweets: list, digest: Digest) -> Path:
+def write_digest(tweets: list, digest: Digest, reposts: int, likes: int) -> Path:
     today = datetime.now().strftime("%Y-%m-%d")
+    reposted, liked = load_state()
     valid = [p for p in digest.picks if 0 <= p.tweet_index < len(tweets) and p.score >= MIN_SCORE]
     by_theme: dict[str, list[Pick]] = {}
     for pick in sorted(valid, key=lambda p: -p.score):
         by_theme.setdefault(pick.theme, []).append(pick)
 
     lines = [f"# Reading list, {today}", ""]
-    lines.append(f"{len(valid)} picks from {len(tweets)} tweets in the last {HOURS_BACK:g} hours.")
+    lines.append(f"{len(valid)} picks from {len(tweets)} tweets in the last {HOURS_BACK:g} hours; "
+                 f"reposted {reposts}, liked {likes} to your timeline.")
     lines.append("")
     for theme, picks in sorted(by_theme.items(), key=lambda kv: -max(p.score for p in kv[1])):
         lines.append(f"## {theme}")
@@ -197,10 +252,17 @@ def write_digest(tweets: list, digest: Digest) -> Path:
         for pick in picks:
             tweet = tweets[pick.tweet_index]
             source = getattr(tweet, "retweeted_tweet", None) or tweet
+            tid = str(source.id)
+            tags = []
+            if tid in reposted:
+                tags.append("reposted")
+            if tid in liked:
+                tags.append("liked")
+            tag = f" _({', '.join(tags)})_" if tags else ""
             snippet = " ".join(tweet_text(source).split())
             if len(snippet) > 200:
                 snippet = snippet[:200] + "..."
-            lines.append(f"- **@{source.user.screen_name}** ({pick.score}/10) {pick.reason}")
+            lines.append(f"- **@{source.user.screen_name}** ({pick.score}/10){tag} {pick.reason}")
             lines.append(f"  > {snippet}")
             lines.append(f"  {tweet_url(source)}")
             for link in tweet_links(source):
@@ -219,16 +281,25 @@ def write_digest(tweets: list, digest: Digest) -> Path:
     return path
 
 
-def main() -> None:
-    load_dotenv(ROOT / ".env")
-
+async def run() -> Path | None:
+    client = Client("en-US")
+    authenticate(client)
     print(f"Fetching timeline (last {HOURS_BACK:g}h, max {MAX_TWEETS} tweets)...")
-    tweets = asyncio.run(fetch_tweets())
+    tweets = await fetch_timeline(client)
     if not tweets:
-        sys.exit("No tweets found in the window; nothing to digest.")
+        return None
     print(f"Scoring {len(tweets)} tweets against persona.md...")
     digest = score_tweets(tweets)
-    path = write_digest(tweets, digest)
+    print(f"Reposting picks scoring {REPOST_MIN_SCORE}+, liking {LIKE_MIN_SCORE}+ ...")
+    reposts, likes = await act_on_picks(client, tweets, digest)
+    return write_digest(tweets, digest, reposts, likes)
+
+
+def main() -> None:
+    load_dotenv(ROOT / ".env")
+    path = asyncio.run(run())
+    if path is None:
+        sys.exit("No tweets found in the window; nothing to digest.")
     print(f"Wrote {path}")
 
 

@@ -1,5 +1,6 @@
 .env
 cookies.json
+actions.json
 digests/
 __pycache__/
 *.pyc
