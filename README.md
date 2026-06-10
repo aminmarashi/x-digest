@@ -81,8 +81,8 @@ Optional knobs, also via `.env` or the environment:
 | `HOURS_BACK`         | `24`    | how far back to read the timeline                 |
 | `MAX_TWEETS`         | `150`   | cap on tweets sent to the model                   |
 | `MIN_SCORE`          | `6`     | minimum score to appear in the markdown digest    |
-| `REPOST_MIN_SCORE`   | `8`     | reposted to your timeline at or above this score  |
-| `LIKE_MIN_SCORE`     | `9`     | also liked at or above this score                 |
+| `LIKE_MIN_SCORE`     | `8`     | liked at or above this score                      |
+| `REPOST_MIN_SCORE`   | `9`     | reposted to your timeline at or above this score  |
 | `FOLLOW_MIN_SCORE`   | `10`    | author followed at or above this score            |
 | `REPOST_MAX_PER_RUN` | `25`    | safety cap on reposts per run                     |
 | `FOLLOW_MAX_PER_RUN` | `10`    | safety cap on new follows per run                 |
