@@ -93,9 +93,10 @@ little) is reaching your timeline, move `REPOST_MIN_SCORE` / `LIKE_MIN_SCORE`.
 
 - Reposts are public: they broadcast to your followers and show on your profile. That is the
   point here (you read your own reposts), but tune the thresholds so your stream stays clean.
-- `twikit_patch.py` works around a March 2026 change to X's web client that breaks
-  twikit 2.3.3's transaction-ID parsing ([d60/twikit#408](https://github.com/d60/twikit/issues/408)).
-  It is imported automatically; remove it once upstream ships a fix.
+- `twikit_patch.py` works around 2026 changes to X's web client that break twikit 2.3.3:
+  its transaction-ID parsing ([d60/twikit#408](https://github.com/d60/twikit/issues/408))
+  and its user-payload parsing (X dropped fields that twikit reads unconditionally). It is
+  imported automatically; remove it once upstream ships fixes.
 - Reading and posting through an unofficial client is against X's terms of service. One run
   a day is low traffic, but the account could in principle get flagged. Use a throwaway
   account if that worries you.
