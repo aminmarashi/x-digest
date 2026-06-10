@@ -74,13 +74,12 @@ def env_secret(name: str) -> str | None:
     return result.stdout
 
 
-async def authenticate(client: Client) -> None:
-    """Prefer a cached or supplied browser session; fall back to credential login.
+def authenticate(client: Client) -> None:
+    """Authenticate with a browser session.
 
-    The session-cookie path is the one to use: log in to X once in your browser (where
-    the 1Password passkey works), copy the auth_token and ct0 cookies, and the script
-    reuses the session. Credential login hits X's onboarding flow, which Cloudflare
-    blocks from many IPs, so it is a last resort.
+    Log in to X once in your browser (where the 1Password passkey works), copy the
+    auth_token and ct0 cookies, and the script reuses that session. After the first run
+    the cookies live in cookies.json, so the env vars are only needed once.
     """
     if COOKIES_FILE.exists():
         client.load_cookies(str(COOKIES_FILE))
@@ -88,30 +87,18 @@ async def authenticate(client: Client) -> None:
 
     auth_token = env_secret("X_AUTH_TOKEN")
     ct0 = env_secret("X_CT0")
-    if auth_token and ct0:
-        client.set_cookies({"auth_token": auth_token, "ct0": ct0})
-        client.save_cookies(str(COOKIES_FILE))
-        return
-
-    username = env_secret("X_USERNAME")
-    if not username or not env_secret("X_PASSWORD"):
+    if not auth_token or not ct0:
         sys.exit(
-            "No X session found. Set X_AUTH_TOKEN and X_CT0 (recommended): log in to X in "
-            "your browser with your passkey, then copy those two cookies from DevTools > "
-            "Application > Cookies. See the README. Credential login (X_USERNAME / "
-            "X_PASSWORD) is a fallback and is often blocked by Cloudflare.")
-    await client.login(
-        auth_info_1=username,
-        auth_info_2=env_secret("X_EMAIL") or username,
-        password=env_secret("X_PASSWORD"),
-        totp_secret=env_secret("X_TOTP_SECRET"),
-        cookies_file=str(COOKIES_FILE),
-    )
+            "No X session found. Set X_AUTH_TOKEN and X_CT0: log in to X in your browser "
+            "with your passkey, then copy those two cookies from DevTools > Application > "
+            "Cookies. See the README.")
+    client.set_cookies({"auth_token": auth_token, "ct0": ct0})
+    client.save_cookies(str(COOKIES_FILE))
 
 
 async def fetch_tweets() -> list:
     client = Client("en-US")
-    await authenticate(client)
+    authenticate(client)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
     tweets: list = []
     page = await client.get_latest_timeline(count=40)

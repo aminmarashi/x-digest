@@ -58,10 +58,9 @@ so you only re-copy the cookies when the session eventually expires.
 **Why not a password or passkey directly?** X passkey login is WebAuthn, which only works
 in a browser with an authenticator (the 1Password extension), so a script can't perform
 it. The cookie approach is the way to get a passkey-backed session into the script: you
-authenticate in the browser with the passkey, then reuse the resulting session. Plain
-username/password login (`X_USERNAME`, `X_PASSWORD`, optional `X_EMAIL` / `X_TOTP_SECRET`)
-still exists as a fallback, but X fronts that flow with Cloudflare and frequently blocks
-it, so prefer the cookies.
+authenticate in the browser with the passkey, then reuse the resulting session. (X also
+fronts its username/password login with Cloudflare and frequently blocks it from scripts,
+so cookies are the only path here.)
 
 ## Run
 
