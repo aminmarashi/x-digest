@@ -5,14 +5,16 @@ Output lands in digests/YYYY-MM-DD.md
 """
 
 import asyncio
+import json
 import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import anthropic
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from twikit import Client
 
 ROOT = Path(__file__).parent
@@ -20,7 +22,7 @@ COOKIES_FILE = ROOT / "cookies.json"
 DIGEST_DIR = ROOT / "digests"
 PERSONA = (ROOT / "persona.md").read_text()
 
-MODEL = "claude-haiku-4-5"
+MODEL = os.getenv("CLAUDE_MODEL", "haiku")
 MAX_TWEETS = int(os.getenv("MAX_TWEETS", "150"))
 HOURS_BACK = float(os.getenv("HOURS_BACK", "24"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "6"))
@@ -119,19 +121,34 @@ def render_for_model(index: int, tweet) -> str:
     return "\n".join(lines)
 
 
+def extract_json(text: str) -> str:
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        sys.exit(f"claude returned no JSON, got: {text.strip()[:300]}")
+    return text[start:end + 1]
+
+
 def score_tweets(tweets: list) -> Digest:
-    client = anthropic.Anthropic()
+    if shutil.which("claude") is None:
+        sys.exit("claude CLI not found - install Claude Code first: https://code.claude.com")
     payload = "\n\n---\n\n".join(render_for_model(i, t) for i, t in enumerate(tweets))
-    response = client.messages.parse(
-        model=MODEL,
-        max_tokens=8000,
-        system=SYSTEM,
-        messages=[{"role": "user", "content": payload}],
-        output_format=Digest,
+    schema = json.dumps(Digest.model_json_schema())
+    prompt = (
+        f"{SYSTEM}\n\n"
+        f"Reply with one JSON object matching this schema. No prose, no code fences.\n"
+        f"{schema}\n\n"
+        f"The tweets:\n\n{payload}"
     )
-    if response.parsed_output is None:
-        sys.exit("Model returned no parseable digest; try rerunning.")
-    return response.parsed_output
+    result = subprocess.run(
+        ["claude", "-p", "--model", MODEL],
+        input=prompt, capture_output=True, text=True, timeout=600,
+    )
+    if result.returncode != 0:
+        sys.exit(f"claude -p failed: {(result.stderr or result.stdout).strip()[:500]}")
+    try:
+        return Digest.model_validate_json(extract_json(result.stdout))
+    except ValidationError as err:
+        sys.exit(f"claude returned JSON that does not match the schema: {err}")
 
 
 def write_digest(tweets: list, digest: Digest) -> Path:
@@ -174,7 +191,7 @@ def write_digest(tweets: list, digest: Digest) -> Path:
 
 def main() -> None:
     load_dotenv(ROOT / ".env")
-    require_env("X_USERNAME", "X_PASSWORD", "ANTHROPIC_API_KEY")
+    require_env("X_USERNAME", "X_PASSWORD")
 
     print(f"Fetching timeline (last {HOURS_BACK:g}h, max {MAX_TWEETS} tweets)...")
     tweets = asyncio.run(fetch_tweets())

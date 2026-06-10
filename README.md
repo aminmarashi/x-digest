@@ -11,15 +11,18 @@ of the timeline.
    (the official API no longer has a free read tier; the cheapest plan that can read your
    timeline is $200/month). The session cookie is cached in `cookies.json`, so it logs in
    once and reuses the session after that.
-2. Tweets get sent to Claude (Haiku, costs about a cent per run) with the persona as the
-   rubric. The model picks what is worth your time, scores it 1-10, and groups it by theme.
+2. Tweets get scored by Claude through the [Claude Code](https://code.claude.com) CLI
+   (`claude -p`), with the persona as the rubric. It runs on whatever Claude login you
+   already have, so there is no API key to manage. The model picks what is worth your time,
+   scores it 1-10, and groups it by theme.
 3. Picks scoring 6 or higher land in `digests/YYYY-MM-DD.md`, highest score first, with the
    tweet link and any external links. A "Skipped" section lists what dominated the feed but
    got filtered, so you can tell when the persona needs adjusting.
 
 ## Setup
 
-Needs Python 3.10+.
+Needs Python 3.10+ and [Claude Code](https://code.claude.com) installed and logged in
+(`claude` must be on your PATH).
 
 ```sh
 git clone https://github.com/aminmarashi/x-digest.git
@@ -31,12 +34,11 @@ cp .env.example .env   # then fill it in
 
 `.env` is gitignored. It needs:
 
-| Variable            | What                                                        |
-|---------------------|-------------------------------------------------------------|
-| `X_USERNAME`        | your X handle, without the @                                |
-| `X_EMAIL`           | the email on the account (X sometimes asks for it at login) |
-| `X_PASSWORD`        | your X password                                             |
-| `ANTHROPIC_API_KEY` | from [console.anthropic.com](https://console.anthropic.com) |
+| Variable     | What                                                        |
+|--------------|-------------------------------------------------------------|
+| `X_USERNAME` | your X handle, without the @                                |
+| `X_EMAIL`    | the email on the account (X sometimes asks for it at login) |
+| `X_PASSWORD` | your X password                                             |
 
 ## Run
 
@@ -48,11 +50,12 @@ Then open `digests/<today>.md`.
 
 Optional knobs, also via `.env` or the environment:
 
-| Variable     | Default | What                                       |
-|--------------|---------|--------------------------------------------|
-| `HOURS_BACK` | `24`    | how far back to read the timeline          |
-| `MAX_TWEETS` | `150`   | cap on tweets sent to the model            |
-| `MIN_SCORE`  | `6`     | minimum relevance score to make the digest |
+| Variable       | Default | What                                       |
+|----------------|---------|--------------------------------------------|
+| `CLAUDE_MODEL` | `haiku` | model passed to `claude -p --model`        |
+| `HOURS_BACK`   | `24`    | how far back to read the timeline          |
+| `MAX_TWEETS`   | `150`   | cap on tweets sent to the model            |
+| `MIN_SCORE`    | `6`     | minimum relevance score to make the digest |
 
 ## Make it yours
 
