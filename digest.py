@@ -33,6 +33,7 @@ LIKE_MIN_SCORE = int(os.getenv("LIKE_MIN_SCORE", "8"))      # also liked
 REPOST_MIN_SCORE = int(os.getenv("REPOST_MIN_SCORE", "9"))  # reposted to your timeline
 FOLLOW_MIN_SCORE = int(os.getenv("FOLLOW_MIN_SCORE", "10")) # author followed
 REPOST_MAX_PER_RUN = int(os.getenv("REPOST_MAX_PER_RUN", "25"))  # safety cap per run
+LIKE_MAX_PER_RUN = int(os.getenv("LIKE_MAX_PER_RUN", "25"))      # safety cap per run
 FOLLOW_MAX_PER_RUN = int(os.getenv("FOLLOW_MAX_PER_RUN", "10"))  # safety cap per run
 
 SYSTEM = f"""You curate a daily reading list from an X timeline for one specific person.
@@ -44,19 +45,37 @@ Their persona follows; treat it as the rubric.
 
 Hard filter, applied before anything else: this person only wants technical substance --
 engineering, systems, code, architecture, research results and methods, benchmarks, how
-things actually work, tools and APIs. Exclude anything whose value is commentary rather
-than technical content, EVEN IF the topic matches the persona: company or product policy
-complaints, AI hype or fear/doom about the future, opinion, punditry, predictions, hot
-takes, career or business gossip, funding, and drama. If a tweet is not technical, it does
-not qualify -- score it 2 or below so it drops out. When unsure whether something is
-technical enough, leave it out.
+things actually work, tools and APIs. Exclude anything whose value is commentary or
+spectacle rather than technical content you can learn a method from, EVEN IF the topic
+matches the persona: company or product policy complaints, AI hype or fear/doom about the
+future, opinion, punditry, predictions, hot takes, career or business gossip, funding, and
+drama. Three traps to reject specifically, because they imitate technical content:
+
+- AI wow-demos and capability flexes: "look what the model did", "it built X in N minutes"
+  posts that marvel at a result without explaining the method, showing numbers, or teaching
+  how it works. An impressive output (a CAD model, a working app) is not substance; the how
+  is. Drop these.
+- Jokes, satire, memes, and bits, even when written in fluent technical vocabulary. Judge
+  the tone and intent, not the keywords -- a sentence full of real ML terms can still be a
+  gag. If it reads as a joke, drop it.
+- Bare link-drops, announcements, and amplification: "here's a cool thing", "I shipped X",
+  "great post by @y", where the actual content lives in the link and the tweet itself carries
+  no standalone technical substance. A link is a plus only when the tweet states the concrete
+  technical content; pointing at substance is not the same as containing it.
+
+If a tweet is not technical, it does not qualify -- score it 2 or below so it drops out. When
+unsure whether something is technical enough, leave it out.
 
 You get a numbered list of tweets. For each tweet worth this person's reading time, emit a
 pick with the tweet's index, a short theme (2-4 words, reuse themes across picks so they
 group well), a 1-10 relevance score, one sentence on why it earns a spot, and a description.
 Score 10 means "would have hunted this down anyway", 6 means "worth a skim". Skip everything
-below 6; do not pad the list. Judge linked content by the tweet's description of it. Retweets
-count for their content, not the retweeter. Also report skipped_themes: the 3-5 topics that
+below 6; do not pad the list. Scores of 8 or above cause the tweet to be liked and reposted
+on this person's public profile, so reserve 8-10 for tweets whose technical substance is in
+the tweet itself -- a method, numbers, code, or a concrete explanation they can act on. A
+tweet that merely points at substance elsewhere (a link, an announcement, "great post by @y")
+tops out at 7 no matter how good the linked thing is, so it can still surface as a skim
+without being amplified. Retweets count for their content, not the retweeter. Also report skipped_themes: the 3-5 topics that
 dominated the timeline but did not make the cut, so the person can sanity-check the filter.
 
 The description is a short, plain-language statement of what the tweet is actually about, in
@@ -152,25 +171,33 @@ async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[in
     This is what turns your profile into the feed you read: highest-confidence picks get
     reposted (and the very best liked), and authors of a perfect-score tweet get followed
     so the next ones reach you directly. New follows come mostly from reposts in your feed
-    of accounts you don't already follow. Anything already acted on is skipped.
+    of accounts you don't already follow. Anything already acted on is skipped. Each action
+    type has its own per-run cap (REPOST/LIKE/FOLLOW_MAX_PER_RUN) counted over the actions
+    actually taken, so hitting one cap does not stop the others.
     """
     reposted, liked, followed = load_state()
     new_reposts = new_likes = new_follows = 0
+    # Consider every pick that clears any action's threshold. Each cap below limits the
+    # number of *new* actions actually taken, counted after the per-tweet filtering
+    # (already acted on, already reposted/favorited, already following), so one action
+    # type reaching its cap never stops the others from being applied.
+    threshold = min(REPOST_MIN_SCORE, LIKE_MIN_SCORE, FOLLOW_MIN_SCORE)
     candidates = sorted(
         (p for p in digest.picks
-         if 0 <= p.tweet_index < len(tweets) and p.score >= REPOST_MIN_SCORE),
+         if 0 <= p.tweet_index < len(tweets) and p.score >= threshold),
         key=lambda p: -p.score)
 
     for pick in candidates:
-        if new_reposts >= REPOST_MAX_PER_RUN:
-            print(f"  hit repost cap ({REPOST_MAX_PER_RUN}); stopping.")
-            break
+        if new_reposts >= REPOST_MAX_PER_RUN and new_likes >= LIKE_MAX_PER_RUN \
+                and new_follows >= FOLLOW_MAX_PER_RUN:
+            break  # every cap reached; nothing left to do
         tweet = tweets[pick.tweet_index]
         source = getattr(tweet, "retweeted_tweet", None) or tweet
         tid, author = str(source.id), source.user
         handle, uid = author.screen_name, str(author.id)
 
-        if tid not in reposted and not getattr(source, "retweeted", False):
+        if pick.score >= REPOST_MIN_SCORE and new_reposts < REPOST_MAX_PER_RUN \
+                and tid not in reposted and not getattr(source, "retweeted", False):
             try:
                 await client.retweet(tid)
                 reposted.add(tid)
@@ -180,8 +207,8 @@ async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[in
             except Exception as err:
                 print(f"  repost failed for @{handle}: {_first_line(err)}")
 
-        if pick.score >= LIKE_MIN_SCORE and tid not in liked \
-                and not getattr(source, "favorited", False):
+        if pick.score >= LIKE_MIN_SCORE and new_likes < LIKE_MAX_PER_RUN \
+                and tid not in liked and not getattr(source, "favorited", False):
             try:
                 await client.favorite_tweet(tid)
                 liked.add(tid)

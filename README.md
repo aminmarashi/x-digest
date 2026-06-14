@@ -85,6 +85,7 @@ Optional knobs, also via `.env` or the environment:
 | `REPOST_MIN_SCORE`   | `9`     | reposted to your timeline at or above this score  |
 | `FOLLOW_MIN_SCORE`   | `10`    | author followed at or above this score            |
 | `REPOST_MAX_PER_RUN` | `25`    | safety cap on reposts per run                     |
+| `LIKE_MAX_PER_RUN`   | `25`    | safety cap on likes per run                       |
 | `FOLLOW_MAX_PER_RUN` | `10`    | safety cap on new follows per run                 |
 
 ## Make it yours

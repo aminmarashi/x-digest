@@ -39,8 +39,10 @@ OpenAI models into the products I build on the side.
 
 ## Taste
 
-- Long-form technical content beats hot takes. A linked blog post, paper, or repo raises the
-  score; prefer tweets that point somewhere with substance.
+- Long-form technical content beats hot takes. A linked blog post, paper, or repo is a plus
+  only when the tweet itself states the concrete substance. A bare "here's a cool post"
+  announcement that just points at the content is not, and should never be auto-reposted or
+  liked, however good the linked thing is.
 - Concrete beats abstract: numbers, benchmarks, code, architecture diagrams, postmortems.
 - Contrarian is fine when argued. Skepticism about AI hype is welcome; cheerleading is not.
 - Internals and "how it actually works" deep dives are always interesting.
@@ -56,6 +58,12 @@ do not want it, even when the topic is one I otherwise care about. In particular
 - Fear, doom, or hype about the future of AI; "AI will/won't take our jobs" takes.
 - Opinion, punditry, predictions, and hot takes with no technical content to learn from.
 - Career, hiring, funding, and business gossip; industry drama.
+- AI wow-demos and capability flexes: "look what it built in N minutes" with no method,
+  numbers, or how-it-works. The impressive output is not the substance; the method is.
+- Jokes, satire, memes, and bits, even in fluent technical language. Judge tone and intent,
+  not vocabulary -- a sentence full of real terms can still be a gag.
+- Bare link-drops, announcements, and amplification where the substance lives entirely in
+  the link and the tweet itself says nothing concrete.
 
 The test: would I learn something I could act on or build with? If it's just someone's view,
 drop it.
