@@ -1,5 +1,6 @@
 .env
 cookies.json
+query_ids.json
 actions.json
 digests/
 __pycache__/

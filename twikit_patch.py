@@ -11,12 +11,24 @@
    KeyError on any timeline that contains such a user. The wrapper backfills the keys
    twikit assumes with safe defaults before delegating to the original __init__.
 
-Delete once upstream ships fixes (open PRs: #410, #411, #416).
+3. Retweet query IDs: X rotated the persisted-query operation IDs, so twikit's hardcoded
+   CreateRetweet/DeleteRetweet endpoints now 404 (empty body -> NotFound) while likes and
+   follows still work. The GQLClient.retweet wrapper re-discovers the live IDs from X's web
+   bundle on a 404, caches them in query_ids.json, and retries once. Cached IDs are applied
+   on import so the rediscovery only ever runs the first time after a rotation.
+
+Delete once upstream ships fixes (open PRs: #410, #411, #416). The retweet patch
+(section 3) self-heals, so it can stay until upstream tracks the rotating IDs.
 """
 
+import json
 import re
+from pathlib import Path
 
 from twikit import user as user_module
+from twikit.client import gql
+from twikit.client.gql import Endpoint, GQLClient
+from twikit.errors import NotFound
 from twikit.x_client_transaction import transaction
 
 CHUNK_ID_REGEX = re.compile(r'[,{]\s*(\d+)\s*:\s*["\']ondemand\.s["\']')
@@ -94,3 +106,158 @@ def patched_user_init(self, client, data):
 
 
 user_module.User.__init__ = patched_user_init
+
+
+# --- 3. Self-healing retweet query IDs -------------------------------------------------
+
+# X serves CreateRetweet/DeleteRetweet as persisted GraphQL queries keyed by an operation
+# ID baked into the web bundle. When X rotates an ID, twikit's hardcoded endpoint 404s
+# (empty body -> NotFound) even though the tweet exists -- which is why reposts broke while
+# likes/follows kept working. We cache the live IDs next to cookies.json and, on a 404,
+# re-scrape them from the current web bundle and retry once. Only these two ops are touched.
+
+QUERY_IDS_FILE = Path(__file__).parent / "query_ids.json"
+
+# operation name -> the Endpoint attribute that carries its URL
+RETWEET_OPS = {"CreateRetweet": "CREATE_RETWEET", "DeleteRetweet": "DELETE_RETWEET"}
+
+# abs.twimg.com client-web bundle URLs, e.g. .../client-web/main.<hash>.js
+BUNDLE_URL_REGEX = re.compile(
+    r'https://abs\.twimg\.com/responsive-web/client-web[^"\']*?\.js')
+# Operation ID charset; 16+ chars covers the 22-char base64-ish IDs X currently uses.
+QUERY_ID_REGEX = re.compile(r'queryId:"([A-Za-z0-9_-]{16,})"')
+
+# Browser UA so abs.twimg.com / x.com serve the real web bundle rather than a stub.
+DISCOVERY_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def _endpoint_url(query_id: str, operation: str) -> str:
+    """Rebuild an Endpoint URL the same way twikit's Endpoint.url() does."""
+    return f"https://{gql.DOMAIN}/i/api/graphql/{query_id}/{operation}"
+
+
+def _current_query_id(operation: str) -> str | None:
+    url = getattr(Endpoint, RETWEET_OPS[operation], None)
+    return gql.get_query_id(url) if url else None
+
+
+def _apply_query_ids(ids: dict) -> None:
+    """Point the relevant Endpoint attributes at the given operation IDs."""
+    for operation, attr in RETWEET_OPS.items():
+        query_id = ids.get(operation)
+        if query_id:
+            setattr(Endpoint, attr, _endpoint_url(query_id, operation))
+
+
+def _load_cached_query_ids() -> dict:
+    try:
+        data = json.loads(QUERY_IDS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {op: data[op] for op in RETWEET_OPS if isinstance(data.get(op), str)}
+
+
+def _persist_query_ids(ids: dict) -> None:
+    merged = _load_cached_query_ids()
+    merged.update({op: v for op, v in ids.items() if op in RETWEET_OPS and v})
+    try:
+        QUERY_IDS_FILE.write_text(json.dumps(merged, indent=2))
+    except OSError:
+        pass  # cache is best-effort; a write failure just means we rediscover next time
+
+
+def _extract_query_id(script: str, operation: str) -> str | None:
+    """Find an operation's queryId in a minified bundle, tolerant of field order.
+
+    The live shape is `queryId:"<id>",operationName:"<op>"`, but X minifies field order
+    freely. Within one persisted-query module object queryId and operationName sit right
+    next to each other, so we anchor on the operation name and pick the *closest* queryId
+    in either direction -- a queryId belonging to a neighbouring module is much farther off.
+    """
+    op_matches = list(re.finditer(rf'operationName:"{re.escape(operation)}"', script))
+    if not op_matches:
+        return None
+    qid_matches = list(QUERY_ID_REGEX.finditer(script))
+    best_id, best_dist = None, None
+    for op_match in op_matches:
+        for qid_match in qid_matches:
+            dist = abs(qid_match.start() - op_match.start())
+            if dist <= 400 and (best_dist is None or dist < best_dist):
+                best_id, best_dist = qid_match.group(1), dist
+    return best_id
+
+
+async def _fetch_text(session, url: str) -> str:
+    response = await session.request(
+        method="GET", url=url, headers={"User-Agent": DISCOVERY_USER_AGENT})
+    return str(response.text)
+
+
+async def discover_query_ids(session, user_agent: str | None = None,
+                             home_html: str | None = None) -> dict:
+    """Best-effort scrape of the current CreateRetweet/DeleteRetweet IDs from X's web bundle.
+
+    Fetches x.com's home page (following the migration redirect), enumerates the
+    client-web JS bundles it references, and regexes each for the operation IDs. Any
+    network or parse failure returns {} so the caller keeps twikit's fallback ID.
+    Returns only the operations actually found.
+    """
+    try:
+        if home_html is None:
+            headers = {
+                "User-Agent": user_agent or DISCOVERY_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            home_html = str(await transaction.handle_x_migration(session, headers))
+
+        found: dict = {}
+        bundle_urls = list(dict.fromkeys(BUNDLE_URL_REGEX.findall(home_html)))
+        # main.<hash>.js currently carries the mutations, so try it first.
+        bundle_urls.sort(key=lambda u: 0 if "/main." in u else 1)
+
+        for url in bundle_urls:
+            script = await _fetch_text(session, url)
+            for operation in RETWEET_OPS:
+                if operation not in found:
+                    query_id = _extract_query_id(script, operation)
+                    if query_id:
+                        found[operation] = query_id
+            if all(op in found for op in RETWEET_OPS):
+                break
+        return found
+    except Exception:
+        return {}
+
+
+_original_retweet = GQLClient.retweet
+
+
+async def patched_retweet(self, tweet_id):
+    try:
+        return await _original_retweet(self, tweet_id)
+    except NotFound:
+        # The ID may have rotated. Re-scrape the live bundle using the already-authed
+        # session. handle_x_migration may have stashed the home page on this client.
+        ct = getattr(self.base, "client_transaction", None)
+        home_response = getattr(ct, "home_page_response", None)
+        home_html = str(home_response) if home_response else None
+        discovered = await discover_query_ids(
+            self.base.http, getattr(self.base, "_user_agent", None), home_html=home_html)
+
+        new_create = discovered.get("CreateRetweet")
+        if not new_create or new_create == _current_query_id("CreateRetweet"):
+            raise  # discovery found nothing new -> behave exactly like stock twikit
+
+        _apply_query_ids(discovered)
+        _persist_query_ids(discovered)
+        return await _original_retweet(self, tweet_id)
+
+
+GQLClient.retweet = patched_retweet
+
+# Apply cached IDs on import so a known rotation costs nothing on subsequent runs.
+_apply_query_ids(_load_cached_query_ids())
