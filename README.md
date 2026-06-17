@@ -12,11 +12,21 @@ what it did and why. Run it once a day.
    (the official API no longer has a free read tier; the cheapest plan that can read your
    timeline is $200/month). You log in to X once in your browser and hand the script two
    session cookies; it caches them in `cookies.json` and reuses the session after that.
-2. Tweets get scored by Claude through the [Claude Code](https://code.claude.com) CLI
+2. Before scoring, it mirrors **your own reposts** into a local `reposts.json` database. It
+   reads your profile's Tweets tab (which includes your retweets), captures the full content
+   of each repost (handle, text, url, date), and rebuilds the file each run to match exactly
+   what you currently repost: un-retweeting something drops it, and reposts older than the
+   fetched window may fall out. The file is gitignored (it holds personal tweet content) and
+   is only overwritten on a successful fetch, so a transient X hiccup never empties it. A
+   capped, recent-first sample of these reposts is fed into the scoring prompt as
+   ground-truth positive examples, so ranking is calibrated to what you actually repost right
+   now. `persona.md` stays the primary rubric; the reposts augment it, and they never
+   override the hard technical-only filter.
+3. Tweets get scored by Claude through the [Claude Code](https://code.claude.com) CLI
    (`claude -p`), with the persona as the rubric. It runs on whatever Claude login you
    already have, so there is no API key to manage. The model picks what is worth your time,
    scores it 1-10, and groups it by theme.
-3. The script acts on the best picks, highest score first:
+4. The script acts on the best picks, highest score first:
    - score **10**: reposted, liked, **and its author followed**
    - score **9**: reposted and liked
    - score **8**: reposted
@@ -28,7 +38,7 @@ what it did and why. Run it once a day.
    in `actions.json`, and it also skips anything you reposted, liked, or follow yourself. New
    follows come mostly from reposts in your feed of accounts you don't already follow (when
    someone you follow boosts a perfect-score tweet from a new account).
-4. Picks scoring `MIN_SCORE` (6) or higher are written to `digests/YYYY-MM-DD.md`, highest
+5. Picks scoring `MIN_SCORE` (6) or higher are written to `digests/YYYY-MM-DD.md`, highest
    first, tagged with what action was taken. A "Skipped" section lists what dominated the
    feed but got filtered, so you can tell when the persona needs adjusting.
 
@@ -110,4 +120,5 @@ too little) is reaching your timeline, move `REPOST_MIN_SCORE` / `LIKE_MIN_SCORE
   a day is low traffic, but the account could in principle get flagged. Use a throwaway
   account if that worries you.
 - Nothing leaves your machine except to go to X and to Claude Code. The session lives in the
-  gitignored `cookies.json`; the repost/like history in the gitignored `actions.json`.
+  gitignored `cookies.json`; the repost/like history in the gitignored `actions.json`; and a
+  mirror of your current reposts in the gitignored `reposts.json`.

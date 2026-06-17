@@ -22,8 +22,16 @@ import twikit_patch  # noqa: F401  applies the d60/twikit#408 fix on import
 ROOT = Path(__file__).parent
 COOKIES_FILE = ROOT / "cookies.json"
 STATE_FILE = ROOT / "actions.json"
+REPOSTS_FILE = ROOT / "reposts.json"
 DIGEST_DIR = ROOT / "digests"
 PERSONA = (ROOT / "persona.md").read_text()
+
+# How many of your own reposts to fetch (cap, kept small to stay polite to X) and how many
+# to feed into the scoring prompt as positive calibration. Plain module constants, NOT env
+# knobs: module-level os.getenv runs at import, before load_dotenv, so a .env knob would be
+# dead.
+REPOST_FETCH_CAP = 120
+REPOST_EXAMPLES = 30
 
 MODEL = os.getenv("CLAUDE_MODEL", "haiku")
 MAX_TWEETS = int(os.getenv("MAX_TWEETS", "150"))
@@ -140,6 +148,65 @@ async def fetch_timeline(client: Client) -> list:
     return tweets[:MAX_TWEETS]
 
 
+async def fetch_my_reposts(client: Client) -> list | None:
+    """Mirror the reposts currently visible on the authenticated user's own profile.
+
+    The profile 'Tweets' tab includes the user's retweets, so we page through it (latest to
+    oldest, bounded by REPOST_FETCH_CAP) and keep the items that are reposts -- an item is a
+    repost when ``retweeted_tweet`` is populated, the same accessor used elsewhere here. For
+    each we capture the *source* tweet's content. Older reposts beyond this window simply do
+    not appear, which is acceptable.
+
+    Returns a list of dicts (possibly empty if the user currently has no visible reposts), or
+    None on any twikit error -- distinct from an empty list so the caller can tell 'fetch
+    failed' from 'fetched, zero reposts' and avoid wiping a good DB on a transient error.
+    """
+    try:
+        try:
+            uid = await client.user_id()
+        except Exception:
+            # Older twikit may not expose user_id(); fall back via the logged-in handle.
+            handle = os.getenv("X_SCREEN_NAME")
+            if not handle:
+                print("  reposts: could not resolve own user id (set X_SCREEN_NAME to enable)")
+                return None
+            uid = str((await client.get_user_by_screen_name(handle)).id)
+
+        reposts: list = []
+        seen: set[str] = set()
+        page = await client.get_user_tweets(uid, "Tweets", count=40)
+        while page and len(reposts) < REPOST_FETCH_CAP:
+            for item in page:
+                source = getattr(item, "retweeted_tweet", None)
+                if not source:
+                    continue
+                sid = str(source.id)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                author = source.user
+                reposts.append({
+                    "id": sid,
+                    "handle": author.screen_name,
+                    "author_id": str(author.id),
+                    "text": tweet_text(source),
+                    "created_at": getattr(source, "created_at", None),
+                    "url": f"https://x.com/{author.screen_name}/status/{sid}",
+                })
+                if len(reposts) >= REPOST_FETCH_CAP:
+                    break
+            if len(reposts) >= REPOST_FETCH_CAP:
+                break
+            nxt = await page.next()
+            if not nxt or not len(nxt):
+                break
+            page = nxt
+        return reposts
+    except Exception as err:
+        print(f"  reposts fetch failed: {_first_line(err)}")
+        return None
+
+
 def load_state() -> tuple[set[str], set[str], set[str]]:
     """Ids already reposted / liked (tweets) and followed (users), so daily runs don't
     act on the same thing twice."""
@@ -157,6 +224,35 @@ def save_state(reposted: set[str], liked: set[str], followed: set[str]) -> None:
     STATE_FILE.write_text(json.dumps(
         {"reposted": sorted(reposted), "liked": sorted(liked), "followed": sorted(followed)},
         indent=2))
+
+
+def load_reposts() -> dict[str, dict]:
+    """The reposts DB: source-tweet-id -> {handle, author_id, text, created_at, url}.
+
+    A mirror of the reposts currently visible on your profile, rebuilt each run from
+    save_reposts. Personal content, so it lives in the gitignored reposts.json.
+    """
+    if REPOSTS_FILE.exists():
+        try:
+            data = json.loads(REPOSTS_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+        except (ValueError, OSError):
+            pass
+    return {}
+
+
+def save_reposts(reposts: list[dict]) -> None:
+    """Rebuild reposts.json to exactly the fetched set (mirror, not merge).
+
+    Reposts the user removed, or that fell outside the fetched window, are dropped and stop
+    counting toward preferences -- the DB reflects the user's reposts as they stand now.
+    Only call this when the fetch SUCCEEDED; on a fetch error leave the file untouched so a
+    transient hiccup never silently empties the DB.
+    """
+    db = {r["id"]: {k: r[k] for k in ("handle", "author_id", "text", "created_at", "url")}
+          for r in reposts}
+    REPOSTS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False))
 
 
 def _first_line(err: Exception) -> str:
@@ -276,13 +372,39 @@ def extract_json(text: str) -> str:
     return text[start:end + 1]
 
 
-def score_tweets(tweets: list) -> Digest:
+def render_reposts_block(reposts: dict[str, dict]) -> str:
+    """A clearly-delimited block of the user's recent reposts as positive calibration, or ""
+    when the DB is empty (so behavior is then identical to having no block at all)."""
+    if not reposts:
+        return ""
+    # Dict order is insertion order; load_reposts preserves the fetch's latest-first order.
+    examples = list(reposts.values())[:REPOST_EXAMPLES]
+    lines = []
+    for r in examples:
+        text = " ".join((r.get("text") or "").split())
+        if len(text) > 280:
+            text = text[:280] + "..."
+        lines.append(f"@{r.get('handle', '?')}: {text}")
+    body = "\n".join(lines)
+    return (
+        "\n<reposts_i_made>\n"
+        "These are tweets this person actually reposted to their own public profile -- "
+        "concrete, ground-truth examples of what clears the bar. Treat them as positive "
+        "calibration: a candidate matching their substance and style should score high. "
+        "They do NOT override the hard technical-only filter or the persona above.\n\n"
+        f"{body}\n"
+        "</reposts_i_made>\n"
+    )
+
+
+def score_tweets(tweets: list, reposts: dict[str, dict] | None = None) -> Digest:
     if shutil.which("claude") is None:
         sys.exit("claude CLI not found - install Claude Code first: https://code.claude.com")
     payload = "\n\n---\n\n".join(render_for_model(i, t) for i, t in enumerate(tweets))
     schema = json.dumps(Digest.model_json_schema())
     prompt = (
-        f"{SYSTEM}\n\n"
+        f"{SYSTEM}\n"
+        f"{render_reposts_block(reposts or {})}\n"
         f"Reply with one JSON object matching this schema. No prose, no code fences.\n"
         f"{schema}\n\n"
         f"The tweets:\n\n{payload}"
@@ -354,12 +476,21 @@ def write_digest(tweets: list, digest: Digest, reposts: int, likes: int, follows
 async def run() -> Path | None:
     client = Client("en-US")
     authenticate(client)
+    print("Mirroring your reposts from your profile...")
+    fetched = await fetch_my_reposts(client)
+    if fetched is not None:
+        save_reposts(fetched)  # rebuild reposts.json to exactly what is visible now
+        print(f"  reposts DB: {len(fetched)} repost(s) currently visible")
+    else:
+        print("  reposts fetch failed; keeping the existing reposts.json")
+    reposts = load_reposts()
     print(f"Fetching timeline (last {HOURS_BACK:g}h, max {MAX_TWEETS} tweets)...")
     tweets = await fetch_timeline(client)
     if not tweets:
         return None
-    print(f"Scoring {len(tweets)} tweets against persona.md...")
-    digest = score_tweets(tweets)
+    print(f"Scoring {len(tweets)} tweets against persona.md"
+          f"{f' + {len(reposts)} reposts' if reposts else ''}...")
+    digest = score_tweets(tweets, reposts)
     print(f"Reposting {REPOST_MIN_SCORE}+, liking {LIKE_MIN_SCORE}+, following {FOLLOW_MIN_SCORE}+ ...")
     reposts, likes, follows = await act_on_picks(client, tweets, digest)
     return write_digest(tweets, digest, reposts, likes, follows)
