@@ -3,6 +3,8 @@ cookies.json
 query_ids.json
 actions.json
 reposts.json
+likes.json
+dislikes.json
 digests/
 __pycache__/
 *.pyc

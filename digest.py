@@ -23,6 +23,8 @@ ROOT = Path(__file__).parent
 COOKIES_FILE = ROOT / "cookies.json"
 STATE_FILE = ROOT / "actions.json"
 REPOSTS_FILE = ROOT / "reposts.json"
+LIKES_FILE = ROOT / "likes.json"
+DISLIKES_FILE = ROOT / "dislikes.json"
 DIGEST_DIR = ROOT / "digests"
 PERSONA = (ROOT / "persona.md").read_text()
 
@@ -32,6 +34,8 @@ PERSONA = (ROOT / "persona.md").read_text()
 # dead.
 REPOST_FETCH_CAP = 120
 REPOST_EXAMPLES = 30
+LIKE_FETCH_CAP = 120
+DISLIKE_EXAMPLES = 30   # how many false positives to feed the scorer (prompt bound only)
 
 MODEL = os.getenv("CLAUDE_MODEL", "haiku")
 MAX_TWEETS = int(os.getenv("MAX_TWEETS", "150"))
@@ -162,15 +166,10 @@ async def fetch_my_reposts(client: Client) -> list | None:
     failed' from 'fetched, zero reposts' and avoid wiping a good DB on a transient error.
     """
     try:
-        try:
-            uid = await client.user_id()
-        except Exception:
-            # Older twikit may not expose user_id(); fall back via the logged-in handle.
-            handle = os.getenv("X_SCREEN_NAME")
-            if not handle:
-                print("  reposts: could not resolve own user id (set X_SCREEN_NAME to enable)")
-                return None
-            uid = str((await client.get_user_by_screen_name(handle)).id)
+        uid = await _resolve_uid(client)
+        if uid is None:
+            print("  reposts: could not resolve own user id (set X_SCREEN_NAME to enable)")
+            return None
 
         reposts: list = []
         seen: set[str] = set()
@@ -204,6 +203,70 @@ async def fetch_my_reposts(client: Client) -> list | None:
         return reposts
     except Exception as err:
         print(f"  reposts fetch failed: {_first_line(err)}")
+        return None
+
+
+async def _resolve_uid(client: Client) -> str | None:
+    """The authenticated user's own numeric id, or None if it cannot be resolved.
+
+    Prefers client.user_id(); older twikit may not expose it, so fall back to the logged-in
+    handle from X_SCREEN_NAME. Shared by the reposts and likes fetchers.
+    """
+    try:
+        return await client.user_id()
+    except Exception:
+        handle = os.getenv("X_SCREEN_NAME")
+        if not handle:
+            return None
+        return str((await client.get_user_by_screen_name(handle)).id)
+
+
+async def fetch_my_likes(client: Client) -> list | None:
+    """Mirror the likes currently visible on the authenticated user's own profile.
+
+    Structurally identical to fetch_my_reposts, but pages the profile 'Likes' tab. Every item
+    on that tab IS a liked tweet, so the item itself is the source (no retweeted_tweet unwrap).
+    Bounded by LIKE_FETCH_CAP; older likes beyond the window simply do not appear.
+
+    Returns a list of dicts (possibly empty if no visible likes), or None on any twikit error
+    -- the same fetch-failed-vs-empty contract as reposts, so the caller never wipes a good DB
+    on a transient error.
+    """
+    try:
+        uid = await _resolve_uid(client)
+        if uid is None:
+            print("  likes: could not resolve own user id (set X_SCREEN_NAME to enable)")
+            return None
+
+        likes: list = []
+        seen: set[str] = set()
+        page = await client.get_user_tweets(uid, "Likes", count=40)
+        while page and len(likes) < LIKE_FETCH_CAP:
+            for item in page:
+                sid = str(item.id)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                author = item.user
+                likes.append({
+                    "id": sid,
+                    "handle": author.screen_name,
+                    "author_id": str(author.id),
+                    "text": tweet_text(item),
+                    "created_at": getattr(item, "created_at", None),
+                    "url": f"https://x.com/{author.screen_name}/status/{sid}",
+                })
+                if len(likes) >= LIKE_FETCH_CAP:
+                    break
+            if len(likes) >= LIKE_FETCH_CAP:
+                break
+            nxt = await page.next()
+            if not nxt or not len(nxt):
+                break
+            page = nxt
+        return likes
+    except Exception as err:
+        print(f"  likes fetch failed: {_first_line(err)}")
         return None
 
 
@@ -255,12 +318,114 @@ def save_reposts(reposts: list[dict]) -> None:
     REPOSTS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False))
 
 
+def load_likes() -> dict[str, dict]:
+    """The likes DB: source-tweet-id -> {handle, author_id, text, created_at, url}.
+
+    A mirror of the likes currently visible on your profile, rebuilt each run from save_likes.
+    Personal content, so it lives in the gitignored likes.json. Same shape as load_reposts.
+    """
+    if LIKES_FILE.exists():
+        try:
+            data = json.loads(LIKES_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+        except (ValueError, OSError):
+            pass
+    return {}
+
+
+def save_likes(likes: list[dict]) -> None:
+    """Rebuild likes.json to exactly the fetched set (mirror, not merge).
+
+    Likes the user removed, or that fell outside the fetched window, are dropped -- the DB
+    reflects the user's likes as they stand now. Only call this when the fetch SUCCEEDED so a
+    transient hiccup never silently empties the DB. Byte-for-byte the save_reposts pattern.
+    """
+    db = {r["id"]: {k: r[k] for k in ("handle", "author_id", "text", "created_at", "url")}
+          for r in likes}
+    LIKES_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False))
+
+
+def load_dislikes() -> dict[str, dict]:
+    """The dislikes DB: tweet-id -> {handle, author_id, text, url, source, undone_at}.
+
+    An accumulating, UNBOUNDED record of tweets the user reposted or liked then UNDID -- strong
+    negative signal (false positives). It is the durable false-positive blocklist, so every id
+    is retained for action-blocking; only the rendered prompt examples are capped. Gitignored.
+    """
+    if DISLIKES_FILE.exists():
+        try:
+            data = json.loads(DISLIKES_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+        except (ValueError, OSError):
+            pass
+    return {}
+
+
+def save_dislikes(db: dict[str, dict]) -> None:
+    DISLIKES_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False))
+
+
+def detect_undones(prev: dict[str, dict], fresh: list | None, source: str,
+                   capped: bool, now: str) -> dict[str, dict]:
+    """Ids present in the PREVIOUS snapshot but gone from the FRESH fetch -- i.e. undone.
+
+    Pure and testable (takes the clock as `now`). Returns {} when we cannot trust a
+    disappearance as an undo:
+    - fresh is None (fetch failed): cannot tell an undo from an outage.
+    - capped (the fetch hit its cap, so coverage is partial): a disappearance could be aging
+      out of the window rather than an undo. Keeping the signal STRONG matters more than catching
+      every undo, so we skip the whole diff in this case.
+    Otherwise each disappeared id yields an entry built from the PREVIOUS snapshot (which still
+    has its text), tagged with `source` ("repost"/"like") and `undone_at = now`.
+    """
+    if fresh is None or capped:
+        return {}
+    fresh_ids = {r["id"] for r in fresh}
+    undone: dict[str, dict] = {}
+    for tid in set(prev) - fresh_ids:
+        entry = prev[tid]
+        undone[tid] = {
+            "handle": entry.get("handle"),
+            "author_id": entry.get("author_id"),
+            "text": entry.get("text"),
+            "url": entry.get("url"),
+            "source": source,
+            "undone_at": now,
+        }
+    return undone
+
+
+def merge_dislikes(db: dict[str, dict], undones: dict[str, dict],
+                   current_ids: set[str]) -> dict[str, dict]:
+    """Fold newly-detected undones into the dislikes DB.
+
+    - Drop any id that is back on the profile (in current_ids): re-endorsed, no longer a false
+      positive.
+    - Add new undones, keeping the EARLIEST undone_at if an id recurs.
+    - Never cap the DB: every retained id is a durable action-block. Bounding happens only at
+      render time. Undos are rare, so unbounded growth is a non-issue.
+    """
+    merged = {tid: entry for tid, entry in db.items() if tid not in current_ids}
+    for tid, entry in undones.items():
+        if tid in current_ids:
+            continue
+        existing = merged.get(tid)
+        if existing and existing.get("undone_at") and entry.get("undone_at"):
+            # Keep the earliest first-seen timestamp.
+            if existing["undone_at"] <= entry["undone_at"]:
+                continue
+        merged[tid] = entry
+    return merged
+
+
 def _first_line(err: Exception) -> str:
     text = str(err).splitlines()
     return (text[0] if text else repr(err))[:120]
 
 
-async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[int, int, int]:
+async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[int, int, int, dict]:
     """Repost picks scoring REPOST_MIN_SCORE+, like those at LIKE_MIN_SCORE+, and follow
     the author of anything at FOLLOW_MIN_SCORE+.
 
@@ -272,7 +437,11 @@ async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[in
     actually taken, so hitting one cap does not stop the others.
     """
     reposted, liked, followed = load_state()
+    dislikes = load_dislikes()  # durable false-positive blocklist; never re-act on these
     new_reposts = new_likes = new_follows = 0
+    # This run's successful endorsements, in the same shape as fetch_my_reposts/fetch_my_likes,
+    # so run() can fold them into the saved mirrors and detect a same-cycle endorse-then-undo.
+    endorsed: dict[str, dict] = {"reposts": {}, "likes": {}}
     # Consider every pick that clears any action's threshold. Each cap below limits the
     # number of *new* actions actually taken, counted after the per-tweet filtering
     # (already acted on, already reposted/favorited, already following), so one action
@@ -293,22 +462,26 @@ async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[in
         handle, uid = author.screen_name, str(author.id)
 
         if pick.score >= REPOST_MIN_SCORE and new_reposts < REPOST_MAX_PER_RUN \
-                and tid not in reposted and not getattr(source, "retweeted", False):
+                and tid not in reposted and tid not in dislikes \
+                and not getattr(source, "retweeted", False):
             try:
                 await client.retweet(tid)
                 reposted.add(tid)
                 new_reposts += 1
+                endorsed["reposts"][tid] = _endorsement_entry(tid, handle, uid, source)
                 print(f"  reposted @{handle} ({pick.score}/10)")
                 await asyncio.sleep(2)
             except Exception as err:
                 print(f"  repost failed for @{handle}: {_first_line(err)}")
 
         if pick.score >= LIKE_MIN_SCORE and new_likes < LIKE_MAX_PER_RUN \
-                and tid not in liked and not getattr(source, "favorited", False):
+                and tid not in liked and tid not in dislikes \
+                and not getattr(source, "favorited", False):
             try:
                 await client.favorite_tweet(tid)
                 liked.add(tid)
                 new_likes += 1
+                endorsed["likes"][tid] = _endorsement_entry(tid, handle, uid, source)
                 print(f"  liked @{handle} ({pick.score}/10)")
                 await asyncio.sleep(2)
             except Exception as err:
@@ -327,7 +500,20 @@ async def act_on_picks(client: Client, tweets: list, digest: Digest) -> tuple[in
 
     if new_reposts or new_likes or new_follows:
         save_state(reposted, liked, followed)
-    return new_reposts, new_likes, new_follows
+    return new_reposts, new_likes, new_follows, endorsed
+
+
+def _endorsement_entry(tid: str, handle: str, uid: str, source) -> dict:
+    """A repost/like the script just made, in the same shape (incl. id) as fetch_my_reposts, so
+    it folds straight into a mirror keyed by r["id"]."""
+    return {
+        "id": tid,
+        "handle": handle,
+        "author_id": uid,
+        "text": tweet_text(source),
+        "created_at": getattr(source, "created_at", None),
+        "url": tweet_url(source),
+    }
 
 
 def tweet_url(tweet) -> str:
@@ -397,7 +583,40 @@ def render_reposts_block(reposts: dict[str, dict]) -> str:
     )
 
 
-def score_tweets(tweets: list, reposts: dict[str, dict] | None = None) -> Digest:
+def render_dislikes_block(dislikes: dict[str, dict]) -> str:
+    """A clearly-delimited block of the user's undone reposts/likes as NEGATIVE calibration, or
+    "" when the DB is empty (so behavior is then identical to having no block at all).
+
+    Only the most recent DISLIKE_EXAMPLES entries (by undone_at) are rendered; the stored
+    blocklist itself is never capped.
+    """
+    if not dislikes:
+        return ""
+    examples = sorted(
+        dislikes.values(),
+        key=lambda d: d.get("undone_at") or "",
+        reverse=True,
+    )[:DISLIKE_EXAMPLES]
+    lines = []
+    for d in examples:
+        text = " ".join((d.get("text") or "").split())
+        if len(text) > 280:
+            text = text[:280] + "..."
+        lines.append(f"@{d.get('handle', '?')}: {text}")
+    body = "\n".join(lines)
+    return (
+        "\n<false_positives>\n"
+        "These are tweets this person reposted or liked and then REMOVED from their profile -- "
+        "ground-truth false positives they did NOT actually want. Treat them as negative "
+        "calibration: a candidate resembling these in substance or style should score LOWER. "
+        "They do NOT override the hard technical-only filter or the persona above.\n\n"
+        f"{body}\n"
+        "</false_positives>\n"
+    )
+
+
+def score_tweets(tweets: list, reposts: dict[str, dict] | None = None,
+                 dislikes: dict[str, dict] | None = None) -> Digest:
     if shutil.which("claude") is None:
         sys.exit("claude CLI not found - install Claude Code first: https://code.claude.com")
     payload = "\n\n---\n\n".join(render_for_model(i, t) for i, t in enumerate(tweets))
@@ -405,6 +624,7 @@ def score_tweets(tweets: list, reposts: dict[str, dict] | None = None) -> Digest
     prompt = (
         f"{SYSTEM}\n"
         f"{render_reposts_block(reposts or {})}\n"
+        f"{render_dislikes_block(dislikes or {})}\n"
         f"Reply with one JSON object matching this schema. No prose, no code fences.\n"
         f"{schema}\n\n"
         f"The tweets:\n\n{payload}"
@@ -476,24 +696,78 @@ def write_digest(tweets: list, digest: Digest, reposts: int, likes: int, follows
 async def run() -> Path | None:
     client = Client("en-US")
     authenticate(client)
-    print("Mirroring your reposts from your profile...")
-    fetched = await fetch_my_reposts(client)
-    if fetched is not None:
-        save_reposts(fetched)  # rebuild reposts.json to exactly what is visible now
-        print(f"  reposts DB: {len(fetched)} repost(s) currently visible")
+
+    # Snapshot what was on the profile last run BEFORE this run mutates anything, then fetch the
+    # fresh state. An id present last run but gone now (within the fetch window) was undone.
+    prev_reposts = load_reposts()
+    prev_likes = load_likes()
+    print("Mirroring your reposts and likes from your profile...")
+    fetched_reposts = await fetch_my_reposts(client)
+    fetched_likes = await fetch_my_likes(client)
+
+    # Detect undos by diffing the previous snapshot against the fresh fetch (per type), then fold
+    # them into the durable dislikes blocklist. Re-present ids are dropped from the blocklist.
+    now = datetime.now(timezone.utc).isoformat()
+    undone: dict[str, dict] = {}
+    for prev, fresh, src, cap in (
+            (prev_reposts, fetched_reposts, "repost", REPOST_FETCH_CAP),
+            (prev_likes, fetched_likes, "like", LIKE_FETCH_CAP)):
+        if fresh is None:
+            continue
+        capped = len(fresh) >= cap
+        if capped:
+            print(f"  {src}s: fetch hit the cap ({cap}); skipping undo detection this run")
+            continue
+        found = detect_undones(prev, fresh, src, capped, now)
+        if found:
+            print(f"  {len(found)} undone {src}(s) captured as negative signals")
+        undone.update(found)
+    current_ids: set[str] = set()
+    for fresh in (fetched_reposts, fetched_likes):
+        if fresh is not None:
+            current_ids |= {r["id"] for r in fresh}
+    dislikes = merge_dislikes(load_dislikes(), undone, current_ids)
+    save_dislikes(dislikes)
+
+    # Early mirror save, so an empty timeline still persists the fresh fetches.
+    if fetched_reposts is not None:
+        save_reposts(fetched_reposts)  # rebuild reposts.json to exactly what is visible now
+        print(f"  reposts DB: {len(fetched_reposts)} repost(s) currently visible")
     else:
         print("  reposts fetch failed; keeping the existing reposts.json")
-    reposts = load_reposts()
+    if fetched_likes is not None:
+        save_likes(fetched_likes)
+        print(f"  likes DB: {len(fetched_likes)} like(s) currently visible")
+    else:
+        print("  likes fetch failed; keeping the existing likes.json")
+
+    reposts_view = load_reposts()  # dict-by-id mirror shape render_reposts_block expects
     print(f"Fetching timeline (last {HOURS_BACK:g}h, max {MAX_TWEETS} tweets)...")
     tweets = await fetch_timeline(client)
     if not tweets:
         return None
+    extras = []
+    if reposts_view:
+        extras.append(f"{len(reposts_view)} reposts")
+    if dislikes:
+        extras.append(f"{len(dislikes)} false-positives")
     print(f"Scoring {len(tweets)} tweets against persona.md"
-          f"{f' + {len(reposts)} reposts' if reposts else ''}...")
-    digest = score_tweets(tweets, reposts)
+          f"{' + ' + ' / '.join(extras) if extras else ''}...")
+    digest = score_tweets(tweets, reposts_view, dislikes)
     print(f"Reposting {REPOST_MIN_SCORE}+, liking {LIKE_MIN_SCORE}+, following {FOLLOW_MIN_SCORE}+ ...")
-    reposts, likes, follows = await act_on_picks(client, tweets, digest)
-    return write_digest(tweets, digest, reposts, likes, follows)
+    n_re, n_li, n_fo, endorsed = await act_on_picks(client, tweets, digest)
+
+    # Re-save the mirrors with this run's endorsements folded in, so next run can detect their
+    # undo. Skip any type whose fetch failed (mirror left untouched -- a residual blind spot
+    # that self-heals on the next successful fetch).
+    if fetched_reposts is not None and endorsed["reposts"]:
+        save_reposts(list({**{r["id"]: r for r in fetched_reposts},
+                           **endorsed["reposts"]}.values()))
+    if fetched_likes is not None and endorsed["likes"]:
+        save_likes(list({**{r["id"]: r for r in fetched_likes},
+                         **endorsed["likes"]}.values()))
+
+    return write_digest(tweets, digest, n_re, n_li, n_fo)
 
 
 def main() -> None:
