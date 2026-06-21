@@ -139,18 +139,25 @@ def authenticate(client: Client) -> None:
 async def fetch_timeline(client: Client) -> list:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
     tweets: list = []
-    page = await client.get_latest_timeline(count=40)
-    while page and len(tweets) < MAX_TWEETS:
-        hit_cutoff = False
-        for tweet in page:
-            created = getattr(tweet, "created_at_datetime", None)
-            if created and created < cutoff:
-                hit_cutoff = True
-                continue
-            tweets.append(tweet)
-        if hit_cutoff or not len(page):
-            break
-        page = await page.next()
+    try:
+        page = await client.get_latest_timeline(count=40)
+        while page and len(tweets) < MAX_TWEETS:
+            hit_cutoff = False
+            for tweet in page:
+                created = getattr(tweet, "created_at_datetime", None)
+                if created and created < cutoff:
+                    hit_cutoff = True
+                    continue
+                tweets.append(tweet)
+            if hit_cutoff or not len(page):
+                break
+            page = await page.next()
+    except Exception as err:
+        # A flaky X response (e.g. twikit KeyError on a transient error envelope) must not
+        # abort the digest: keep whatever we paged so far. If the very first call failed we
+        # return [] and run() exits cleanly with its "No tweets" message.
+        print(f"  timeline fetch interrupted ({_first_line(err)}); "
+              f"proceeding with {len(tweets)} tweet(s)")
     return tweets[:MAX_TWEETS]
 
 
