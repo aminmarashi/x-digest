@@ -17,6 +17,16 @@
    bundle on a 404, caches them in query_ids.json, and retries once. Cached IDs are applied
    on import so the rediscovery only ever runs the first time after a rotation.
 
+4. Error-code extraction: when X returns an error envelope, Client.request reads the
+   code with a hard `response_data['errors'][0]['code']`. X now nests the code GraphQL-style
+   under `errors[0].extensions.code` with no top-level `code`, so the subscript raises
+   `KeyError: code` and masks the real error -- which is why both the timeline and reposts
+   fetches died with the bare message "code". request is replaced with a version that reads
+   the code defensively (`error.get('code')`, then `error.get('extensions', {}).get('code')`)
+   so a missing code falls through to the normal HTTP status handling and the real X error
+   surfaces. twikit's own errors.raise_exceptions_from_response already does this; request
+   was never updated.
+
 Delete once upstream ships fixes (open PRs: #410, #411, #416). The retweet patch
 (section 3) self-heals, so it can stay until upstream tracks the rotating IDs.
 """
@@ -24,11 +34,24 @@ Delete once upstream ships fixes (open PRs: #410, #411, #416). The retweet patch
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from twikit import user as user_module
 from twikit.client import gql
+from twikit.client.client import DOMAIN, Client
 from twikit.client.gql import Endpoint, GQLClient
-from twikit.errors import NotFound
+from twikit.errors import (
+    AccountLocked,
+    AccountSuspended,
+    BadRequest,
+    Forbidden,
+    NotFound,
+    RequestTimeout,
+    ServerError,
+    TooManyRequests,
+    TwitterException,
+    Unauthorized,
+)
 from twikit.x_client_transaction import transaction
 
 CHUNK_ID_REGEX = re.compile(r'[,{]\s*(\d+)\s*:\s*["\']ondemand\.s["\']')
@@ -261,3 +284,105 @@ GQLClient.retweet = patched_retweet
 
 # Apply cached IDs on import so a known rotation costs nothing on subsequent runs.
 _apply_query_ids(_load_cached_query_ids())
+
+
+# --- 4. Defensive error-code extraction in Client.request -----------------------------
+
+# When X returns an error envelope, stock request does `response_data['errors'][0]['code']`.
+# X now nests the code under `errors[0].extensions.code` (GraphQL style) with no top-level
+# `code`, so the subscript raises `KeyError: code` and masks the real error -- the cause of
+# both the timeline and reposts fetches failing with the bare message "code". We replace
+# request with a copy that reads the code defensively (top-level first, then extensions);
+# a missing code stays None, skips the suspended/locked special-casing, and falls through
+# to the normal HTTP status handling so the real X error (status + message) surfaces.
+
+
+async def patched_request(
+    self,
+    method: str,
+    url: str,
+    auto_unlock: bool = True,
+    raise_exception: bool = True,
+    **kwargs
+):
+    ':meta private:'
+    headers = kwargs.pop('headers', {})
+
+    if not self.client_transaction.home_page_response:
+        cookies_backup = self.get_cookies().copy()
+        ct_headers = {
+            'Accept-Language': f'{self.language},{self.language.split("-")[0]};q=0.9',
+            'Cache-Control': 'no-cache',
+            'Referer': f'https://{DOMAIN}',
+            'User-Agent': self._user_agent
+        }
+        await self.client_transaction.init(self.http, ct_headers)
+        self.set_cookies(cookies_backup, clear_cookies=True)
+
+    tid = self.client_transaction.generate_transaction_id(method=method, path=urlparse(url).path)
+    headers['X-Client-Transaction-Id'] = tid
+
+    cookies_backup = self.get_cookies().copy()
+    response = await self.http.request(method, url, headers=headers, **kwargs)
+    self._remove_duplicate_ct0_cookie()
+
+    try:
+        response_data = response.json()
+    except json.decoder.JSONDecodeError:
+        response_data = response.text
+
+    if isinstance(response_data, dict) and 'errors' in response_data:
+        error = response_data['errors'][0]
+        # X nests the code GraphQL-style under extensions; tolerate a missing top-level code.
+        error_code = error.get('code')
+        if error_code is None:
+            error_code = error.get('extensions', {}).get('code')
+        error_message = error.get('message')
+        if error_code in (37, 64):
+            # Account suspended
+            raise AccountSuspended(error_message)
+
+        if error_code == 326:
+            # Account unlocking
+            if self.captcha_solver is None:
+                raise AccountLocked(
+                    'Your account is locked. Visit '
+                    f'https://{DOMAIN}/account/access to unlock it.'
+                )
+            if auto_unlock:
+                await self.unlock()
+                self.set_cookies(cookies_backup, clear_cookies=True)
+                response = await self.http.request(method, url, **kwargs)
+                self._remove_duplicate_ct0_cookie()
+                try:
+                    response_data = response.json()
+                except json.decoder.JSONDecodeError:
+                    response_data = response.text
+
+    status_code = response.status_code
+
+    if status_code >= 400 and raise_exception:
+        message = f'status: {status_code}, message: "{response.text}"'
+        if status_code == 400:
+            raise BadRequest(message, headers=response.headers)
+        elif status_code == 401:
+            raise Unauthorized(message, headers=response.headers)
+        elif status_code == 403:
+            raise Forbidden(message, headers=response.headers)
+        elif status_code == 404:
+            raise NotFound(message, headers=response.headers)
+        elif status_code == 408:
+            raise RequestTimeout(message, headers=response.headers)
+        elif status_code == 429:
+            if await self._get_user_state() == 'suspended':
+                raise AccountSuspended(message, headers=response.headers)
+            raise TooManyRequests(message, headers=response.headers)
+        elif 500 <= status_code < 600:
+            raise ServerError(message, headers=response.headers)
+        else:
+            raise TwitterException(message, headers=response.headers)
+
+    return response_data, response
+
+
+Client.request = patched_request
