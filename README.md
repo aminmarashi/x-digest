@@ -22,10 +22,10 @@ what it did and why. Run it once a day.
    ground-truth positive examples, so ranking is calibrated to what you actually repost right
    now. `persona.md` stays the primary rubric; the reposts augment it, and they never
    override the hard technical-only filter.
-3. Tweets get scored by Claude through the [Claude Code](https://code.claude.com) CLI
-   (`claude -p`), with the persona as the rubric. It runs on whatever Claude login you
-   already have, so there is no API key to manage. The model picks what is worth your time,
-   scores it 1-10, and groups it by theme.
+3. Tweets get scored by [opencode](https://opencode.ai) (`opencode run`), with the persona
+   as the rubric. It runs on whatever opencode login you already have, so there is no API
+   key to manage. The model picks what is worth your time, scores it 1-10, and groups it
+   by theme.
 4. The script acts on the best picks, highest score first:
    - score **10**: reposted, liked, **and its author followed**
    - score **9**: reposted and liked
@@ -44,8 +44,8 @@ what it did and why. Run it once a day.
 
 ## Setup
 
-Needs Python 3.10+ and [Claude Code](https://code.claude.com) installed and logged in
-(`claude` must be on your PATH).
+Needs Python 3.10+ and [opencode](https://opencode.ai) installed and logged in
+(`opencode` must be on your PATH).
 
 ```sh
 git clone https://github.com/aminmarashi/x-digest.git
@@ -87,7 +87,7 @@ Optional knobs, also via `.env` or the environment:
 
 | Variable             | Default | What                                              |
 |----------------------|---------|---------------------------------------------------|
-| `CLAUDE_MODEL`       | `haiku` | model passed to `claude -p --model`               |
+| `OPENCODE_MODEL`     | `ollama-cloud/deepseek-v4-flash` | model passed to `opencode run --model`  |
 | `HOURS_BACK`         | `24`    | how far back to read the timeline                 |
 | `MAX_TWEETS`         | `150`   | cap on tweets sent to the model                   |
 | `MIN_SCORE`          | `6`     | minimum score to appear in the markdown digest    |

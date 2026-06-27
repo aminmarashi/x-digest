@@ -1,4 +1,4 @@
-"""Fetch your X timeline, score it against persona.md with Claude, write a daily reading list.
+"""Fetch your X timeline, score it against persona.md with opencode, write a daily reading list.
 
 Run it once a day: python digest.py
 Output lands in digests/YYYY-MM-DD.md
@@ -39,7 +39,7 @@ FETCH_SAFETY_CAP = int(os.getenv("FETCH_SAFETY_CAP", "1000"))
 REPOST_EXAMPLES = 30
 DISLIKE_EXAMPLES = 30   # how many false positives to feed the scorer (prompt bound only)
 
-MODEL = os.getenv("CLAUDE_MODEL", "haiku")
+MODEL = os.getenv("OPENCODE_MODEL", "ollama-cloud/deepseek-v4-flash")
 MAX_TWEETS = int(os.getenv("MAX_TWEETS", "150"))
 HOURS_BACK = float(os.getenv("HOURS_BACK", "24"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "6"))          # appears in the markdown digest
@@ -625,7 +625,7 @@ def render_for_model(index: int, tweet) -> str:
 def extract_json(text: str) -> str:
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
-        sys.exit(f"claude returned no JSON, got: {text.strip()[:300]}")
+        sys.exit(f"opencode returned no JSON, got: {text.strip()[:300]}")
     return text[start:end + 1]
 
 
@@ -710,8 +710,8 @@ def render_dislikes_block(dislikes: dict[str, dict]) -> str:
 
 def score_tweets(tweets: list, positive: tuple | None = None,
                  dislikes: dict[str, dict] | None = None) -> Digest:
-    if shutil.which("claude") is None:
-        sys.exit("claude CLI not found - install Claude Code first: https://code.claude.com")
+    if shutil.which("opencode") is None:
+        sys.exit("opencode CLI not found - install opencode first: https://opencode.ai")
     profile_reposts, profile_likes, false_negatives = positive or ({}, {}, {})
     payload = "\n\n---\n\n".join(render_for_model(i, t) for i, t in enumerate(tweets))
     schema = json.dumps(Digest.model_json_schema())
@@ -724,15 +724,15 @@ def score_tweets(tweets: list, positive: tuple | None = None,
         f"The tweets:\n\n{payload}"
     )
     result = subprocess.run(
-        ["claude", "-p", "--model", MODEL],
-        input=prompt, capture_output=True, text=True, timeout=600,
+        ["opencode", "run", "--model", MODEL, "--format", "default", prompt],
+        capture_output=True, text=True, timeout=600,
     )
     if result.returncode != 0:
-        sys.exit(f"claude -p failed: {(result.stderr or result.stdout).strip()[:500]}")
+        sys.exit(f"opencode run failed: {(result.stderr or result.stdout).strip()[:500]}")
     try:
         return Digest.model_validate_json(extract_json(result.stdout))
     except ValidationError as err:
-        sys.exit(f"claude returned JSON that does not match the schema: {err}")
+        sys.exit(f"opencode returned JSON that does not match the schema: {err}")
 
 
 def write_digest(tweets: list, digest: Digest, reposts: int, likes: int, follows: int) -> Path:
